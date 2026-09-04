@@ -136,10 +136,10 @@ class ImageMeasureApp:
         self.lines = []                   # list[Line]
         self.selected_line_ids = []       # for compare / delete / calibrate
         self.current_color = tk.StringVar(value=DEFAULT_COLOR)
-        self.mode = tk.StringVar(value="draw")   # 'draw' | 'parallel' | 'select'
-        self.parallel_ref_id = None        # reference line id, when in parallel mode
+        self.mode = tk.StringVar(value="draw")   # 'draw' | 'select'
         self.drag_start_canvas = None
         self.drag_temp_id = None
+        self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
         self.project_path = None
 
         self._build_menu()
@@ -199,8 +199,6 @@ class ImageMeasureApp:
         ttk.Label(bar, text="Mode:").pack(side="left", padx=(0, 4))
         ttk.Radiobutton(bar, text="Draw line", variable=self.mode, value="draw",
                          command=self._on_mode_change).pack(side="left")
-        ttk.Radiobutton(bar, text="Draw parallel", variable=self.mode, value="parallel",
-                         command=self._on_mode_change).pack(side="left")
         ttk.Radiobutton(bar, text="Select", variable=self.mode, value="select",
                          command=self._on_mode_change).pack(side="left")
 
@@ -240,6 +238,7 @@ class ImageMeasureApp:
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.bind("<Motion>", self.on_canvas_hover)         # vertex hover cursor
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)      # Windows/macOS
         self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1, e.x, e.y))  # Linux scroll up
         self.canvas.bind("<Button-5>", lambda e: self.zoom(0.9, e.x, e.y))  # Linux scroll down
@@ -319,9 +318,16 @@ class ImageMeasureApp:
             "   (or leave it blank -- nothing is required).\n"
             "4. Every other line of that color then shows\n"
             "   a computed length automatically.\n\n"
-            "Parallel: pick 'Draw parallel', click near an\n"
-            "existing line, then drag elsewhere to add a\n"
-            "new line locked to the same direction.\n\n"
+            "Parallel: hold Shift while dragging a new line to\n"
+            "lock its direction to the selected line (or the\n"
+            "last line drawn, if none is selected) -- shown\n"
+            "below the toolbar buttons.\n\n"
+            "Editing: hovering over an endpoint of a line in\n"
+            "the CURRENT color shows a move cursor -- drag it\n"
+            "to reposition that point. Hovering over an\n"
+            "endpoint of a DIFFERENT color snaps a new line's\n"
+            "start to that exact point instead, so segments\n"
+            "in different axes can share a corner.\n\n"
             "Compare: select exactly two lines in the list\n"
             "(Ctrl/Shift-click) and click 'Compare 2 Lines'.\n\n"
             "Rotate 90° (toolbar) rotates the photo a quarter\n"
@@ -344,12 +350,10 @@ class ImageMeasureApp:
         bar.pack(side="bottom", fill="x")
 
     def _on_mode_change(self):
-        self.parallel_ref_id = None
-        if self.mode.get() == "parallel":
-            self.parallel_hint.config(text="Parallel mode: click near a line to lock its direction, "
-                                            "then drag to draw the new line.")
-        else:
-            self.parallel_hint.config(text="")
+        self.dragging_vertex = None
+        self.drag_start_canvas = None
+        self.canvas.config(cursor="crosshair" if self.mode.get() == "draw" else "hand2")
+        self._update_parallel_hint()
 
     # ------------------------------------------------------------- image
     def open_image(self):
@@ -533,6 +537,17 @@ class ImageMeasureApp:
                 best, best_d = ln, d
         return best
 
+    def find_vertex_near(self, ix, iy, tolerance_img):
+        """Return (Line, endpoint_index) for the closest line endpoint
+        within tolerance, endpoint_index is 1 or 2. None if nothing's close."""
+        best, best_d = None, tolerance_img
+        for ln in self.lines:
+            for idx, (vx, vy) in ((1, (ln.x1, ln.y1)), (2, (ln.x2, ln.y2))):
+                d = dist((ix, iy), (vx, vy))
+                if d <= best_d:
+                    best, best_d = (ln, idx), d
+        return best
+
     @staticmethod
     def _point_segment_distance(p, a, b):
         ax, ay = a
@@ -545,6 +560,33 @@ class ImageMeasureApp:
         t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / length2))
         proj = (ax + t * dx, ay + t * dy)
         return dist(p, proj)
+
+    def _parallel_reference(self):
+        """The line a Shift-constrained drag should run parallel to: the
+        single selected line if there is one, otherwise the last line
+        drawn. None if there's nothing to reference yet."""
+        if len(self.selected_line_ids) == 1:
+            ln = self._line_by_id(self.selected_line_ids[0])
+            if ln:
+                return ln
+        return self.lines[-1] if self.lines else None
+
+    def _update_parallel_hint(self):
+        ref = self._parallel_reference()
+        if ref:
+            self.parallel_hint.config(
+                text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
+        else:
+            self.parallel_hint.config(text="")
+
+    def _constrain_to_reference(self, ix1, iy1, ix2, iy2, ref):
+        """Project (ix2, iy2) onto the line through (ix1, iy1) running in
+        ref's direction, so the new segment is parallel to ref."""
+        ang = ref.angle()
+        dirx, diry = math.cos(ang), math.sin(ang)
+        vx, vy = ix2 - ix1, iy2 - iy1
+        proj_len = vx * dirx + vy * diry
+        return ix1 + proj_len * dirx, iy1 + proj_len * diry
 
     def on_canvas_press(self, event):
         if not self.pil_image:
@@ -560,42 +602,51 @@ class ImageMeasureApp:
                 self.select_line(None)
             return
 
-        if self.mode.get() == "parallel":
-            if self.parallel_ref_id is None:
-                ln = self.find_line_near(ix, iy, tol_img)
-                if ln:
-                    self.parallel_ref_id = ln.id
-                    self.select_line(ln.id)
-                    self.parallel_hint.config(
-                        text=f"Reference: line #{ln.id} ({ln.color}). "
-                             f"Now drag to draw the parallel line.")
-                else:
-                    self.status.set("Click closer to an existing line to use as the parallel reference.")
+        # draw mode: hovering an endpoint either moves it (same color as the
+        # one you've got selected to draw with) or snaps a new line's start
+        # to it (different color -- chaining a segment onto another axis).
+        self.dragging_vertex = None
+        hit = self.find_vertex_near(ix, iy, tol_img)
+        if hit:
+            vline, vidx = hit
+            if vline.color == self.current_color.get():
+                self.dragging_vertex = (vline, vidx)
+                self.drag_start_canvas = None
+                self.select_line(vline.id)
                 return
-            # reference already chosen: fall through to start a drag
+            vx, vy = (vline.x1, vline.y1) if vidx == 1 else (vline.x2, vline.y2)
+            self.drag_start_canvas = self.img_to_canvas(vx, vy)
+            self.drag_temp_id = None
+            return
 
         self.drag_start_canvas = (event.x, event.y)
         self.drag_temp_id = None
 
     def on_canvas_drag(self, event):
-        if not self.pil_image or self.drag_start_canvas is None:
+        if not self.pil_image:
             return
-        if self.mode.get() not in ("draw", "parallel"):
+
+        if self.dragging_vertex is not None:
+            ln, idx = self.dragging_vertex
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            if idx == 1:
+                ln.x1, ln.y1 = ix, iy
+            else:
+                ln.x2, ln.y2 = ix, iy
+            self.redraw()
+            return
+
+        if self.drag_start_canvas is None or self.mode.get() != "draw":
             return
         cx, cy = event.x, event.y
         sx, sy = self.drag_start_canvas
 
-        if self.mode.get() == "parallel" and self.parallel_ref_id is not None:
-            ref = self._line_by_id(self.parallel_ref_id)
+        if event.state & 0x0001:  # Shift held: constrain to parallel reference
+            ref = self._parallel_reference()
             if ref:
-                ang = ref.angle()
-                dirx, diry = math.cos(ang), math.sin(ang)
-                # project drag vector (in image space) onto reference direction
                 ix1, iy1 = self.canvas_to_img(sx, sy)
                 ix2, iy2 = self.canvas_to_img(cx, cy)
-                vx, vy = ix2 - ix1, iy2 - iy1
-                proj_len = vx * dirx + vy * diry
-                ex, ey = ix1 + proj_len * dirx, iy1 + proj_len * diry
+                ex, ey = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 cx, cy = self.img_to_canvas(ex, ey)
 
         color_hex = AXIS_COLORS[self.current_color.get()]["hex"]
@@ -605,10 +656,33 @@ class ImageMeasureApp:
             self.drag_temp_id = self.canvas.create_line(
                 sx, sy, cx, cy, fill=color_hex, width=2, dash=(4, 2))
 
-    def on_canvas_release(self, event):
-        if not self.pil_image or self.drag_start_canvas is None:
+    def on_canvas_hover(self, event):
+        """No button held: just update the cursor to hint what a click here
+        would do (move a vertex vs. snap-start a new line vs. plain draw)."""
+        if not self.pil_image or self.mode.get() != "draw":
             return
-        if self.mode.get() not in ("draw", "parallel"):
+        ix, iy = self.canvas_to_img(event.x, event.y)
+        tol_img = HIT_TOLERANCE / self.scale
+        hit = self.find_vertex_near(ix, iy, tol_img)
+        if hit and hit[0].color == self.current_color.get():
+            self.canvas.config(cursor="fleur")
+        elif hit:
+            self.canvas.config(cursor="hand2")
+        else:
+            self.canvas.config(cursor="crosshair")
+
+    def on_canvas_release(self, event):
+        if not self.pil_image:
+            return
+
+        if self.dragging_vertex is not None:
+            ln, idx = self.dragging_vertex
+            self.dragging_vertex = None
+            self.redraw()
+            self.status.set(f"Moved line #{ln.id}'s endpoint.")
+            return
+
+        if self.drag_start_canvas is None or self.mode.get() != "draw":
             self.drag_start_canvas = None
             return
 
@@ -622,22 +696,17 @@ class ImageMeasureApp:
         ix2, iy2 = self.canvas_to_img(cx, cy)
         parallel_to = None
 
-        if self.mode.get() == "parallel" and self.parallel_ref_id is not None:
-            ref = self._line_by_id(self.parallel_ref_id)
+        if event.state & 0x0001:  # Shift held
+            ref = self._parallel_reference()
             if ref:
-                ang = ref.angle()
-                dirx, diry = math.cos(ang), math.sin(ang)
-                vx, vy = ix2 - ix1, iy2 - iy1
-                proj_len = vx * dirx + vy * diry
-                ix2, iy2 = ix1 + proj_len * dirx, iy1 + proj_len * diry
+                ix2, iy2 = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 parallel_to = ref.id
 
         self.drag_start_canvas = None
         if dist((ix1, iy1), (ix2, iy2)) < 3 / self.scale:
             return  # treat as a click, not a line
 
-        color = self.current_color.get() if parallel_to is None else \
-            self._line_by_id(parallel_to).color
+        color = self.current_color.get()
         line = Line(color, ix1, iy1, ix2, iy2, unit=self._last_unit_used(),
                     parallel_to=parallel_to)
         self.lines.append(line)
@@ -647,11 +716,6 @@ class ImageMeasureApp:
         # nothing required. Just focus the field with the cursor in place.
         self.known_length_entry.focus_set()
         self.known_length_entry.icursor("end")
-
-        if self.mode.get() == "parallel":
-            self.parallel_ref_id = None
-            self.parallel_hint.config(text="Parallel mode: click near a line to lock its direction, "
-                                            "then drag to draw the new line.")
 
     def _last_unit_used(self):
         for ln in reversed(self.lines):
@@ -672,6 +736,7 @@ class ImageMeasureApp:
             self._draw_line(ln)
         self._update_tree()
         self._update_axis_labels()
+        self._update_parallel_hint()
 
     def _draw_line(self, ln):
         x1, y1 = self.img_to_canvas(ln.x1, ln.y1)

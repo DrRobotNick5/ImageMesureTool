@@ -46,11 +46,19 @@ python image_measure_tool.py
   the pixel-length ratio to the first -- even if they're different colors/axes,
   and without needing a fully calibrated axis. You can apply the result as
   that line's known length.
-- **Draw parallel**: switch to this mode, click near an existing line (locks
-  its direction), then drag anywhere on the image -- the new line is forced
-  to the same angle as the reference line. Useful for measuring opposite
-  edges of an object (e.g. both long sides of a box) even if your drag isn't
-  pixel-perfect.
+- **Parallel (Shift)**: hold Shift while dragging a new line and it snaps to
+  run parallel to a reference line -- whichever line is selected in the side
+  list, or the last line you drew if nothing's selected. The current
+  reference is always shown next to the toolbar buttons. Useful for
+  measuring opposite edges of an object (e.g. both long sides of a box)
+  even if your drag isn't pixel-perfect.
+- **Editing endpoints**: hover over the end of a line drawn in the *current*
+  color and the cursor turns into a move icon -- drag it to reposition that
+  point. Hover over the end of a line in a *different* color and the cursor
+  turns into a hand instead: starting a new line there snaps its start point
+  exactly onto that vertex, so segments measuring different axes can share
+  a precise corner (e.g. a red X-edge and a green Y-edge meeting at the same
+  pixel).
 - **Save Project / Open Project** stores the image path and every line
   (color, endpoints, known length, unit) in a `.json` file so you can pick up
   where you left off.
