@@ -28,17 +28,23 @@ python image_measure_tool.py
   that comes in sideways is automatically rotated to match how Windows/Photos
   displays it (both read the same EXIF orientation tag in the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
-  press **Tab** to cycle to the next color (**Shift+Tab** for the previous
-  one), so you don't have to reach for the mouse between measurements. These
-  are just labels for three independent axes you calibrate separately (e.g.
+  press the **Space bar** to cycle to the next color, so you don't have to
+  reach for the mouse between measurements. Space is ignored (and can't type
+  a stray space) while the known-length field has focus -- typing a length
+  always takes priority there. These are just labels for three independent
+  axes you calibrate separately (e.g.
   red for horizontal, green for vertical, blue for depth) -- use them however
   makes sense for your shot.
-- Drag on the image to draw a line in the selected color. It's selected
-  automatically and the **known length** field in the panel on the left is
-  focused, ready to type into -- no popup. Type a number and press Enter (any
-  unit: mm/cm/m/in/ft/px), or leave it blank; nothing is required, and you can
-  always come back later by clicking the line (or its row in the list below)
-  and typing into that same field.
+- Draw a line in the selected color two ways: **hold** the mouse button and
+  drag, releasing to finish it -- or just **click** once to start it, move
+  the mouse to aim (the line follows your cursor live, no button held), and
+  **click again** to finish it wherever you land. **Esc** cancels a line
+  started this way before you've closed it. Either way, the finished line is
+  selected automatically and the **known length** field in the panel on the
+  left is focused, ready to type into -- no popup. Type a number and press
+  Enter (any unit: mm/cm/m/in/ft/px), or leave it blank; nothing is required,
+  and you can always come back later by clicking the line (or its row in the
+  list below) and typing into that same field.
 - **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
   clockwise and keeps every line attached to the same spot on the picture.
 - Once one line of a color has a known length, every other line of that same

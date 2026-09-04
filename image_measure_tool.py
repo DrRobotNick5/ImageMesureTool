@@ -62,6 +62,7 @@ AXIS_COLORS = {
 DEFAULT_COLOR = "red"
 HANDLE_RADIUS = 5
 HIT_TOLERANCE = 6  # pixels, in canvas/screen space
+CLICK_MOVE_THRESHOLD = 4  # canvas pixels of movement that turns a click into a drag
 PROJECT_EXT = ".imt.json"
 
 
@@ -138,9 +139,12 @@ class ImageMeasureApp:
         self.selected_line_ids = []       # for compare / delete / calibrate
         self.current_color = tk.StringVar(value=DEFAULT_COLOR)
         self.mode = tk.StringVar(value="draw")   # 'draw' | 'select'
-        self.drag_start_img = None        # (ix, iy) anchor for the line being drawn
-        self.drag_temp_id = None
+        self.drag_start_img = None        # (ix, iy) anchor for a hold-and-drag line
+        self.drag_temp_id = None          # canvas id of the dashed preview line
         self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
+        self.press_canvas = None          # (x, y) where the current press started
+        self.press_moved = False          # did the mouse move past the click threshold?
+        self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
         self.project_path = None
 
         self._build_menu()
@@ -150,10 +154,8 @@ class ImageMeasureApp:
 
         self.root.bind("<Delete>", lambda e: self.delete_selected())
         self.root.bind("<BackSpace>", lambda e: self.delete_selected())
-        self.root.bind("<Tab>", lambda e: self.cycle_color(1))
-        self.root.bind("<Shift-Tab>", lambda e: self.cycle_color(-1))
-        # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
-        self.root.bind("<ISO_Left_Tab>", lambda e: self.cycle_color(-1))
+        self.root.bind("<space>", lambda e: self.cycle_color(1))
+        self.root.bind("<Escape>", self.cancel_click_draw)
 
     # ---------------------------------------------------------- UI setup
     def _build_menu(self):
@@ -277,6 +279,10 @@ class ImageMeasureApp:
         self.known_length_entry.pack(side="left")
         self.known_length_entry.bind("<Return>", self.commit_known_length)
         self.known_length_entry.bind("<FocusOut>", self.commit_known_length)
+        # Lengths are numbers -- a space here is never meaningful, so block
+        # it from being typed at all (also keeps it from ever reaching the
+        # Space = cycle-color binding on the window while you're editing).
+        self.known_length_entry.bind("<KeyPress-space>", lambda e: "break")
 
         self.known_unit_var = tk.StringVar(value="mm")
         self.known_unit_box = ttk.Combobox(
@@ -315,11 +321,16 @@ class ImageMeasureApp:
 
         help_text = (
             "How to measure:\n"
-            "1. Pick a color (X/Y/Z) above, or press Tab to\n"
-            "   cycle it (Shift+Tab to go the other way).\n"
-            "2. Drag on the image to draw a line -- it's\n"
-            "   selected automatically and the known-length\n"
-            "   field above is focused and ready to type in.\n"
+            "1. Pick a color (X/Y/Z) above, or press the Space\n"
+            "   bar to cycle it -- unless the known-length\n"
+            "   field has focus, where typing wins instead.\n"
+            "2. Draw a line either by holding the mouse button\n"
+            "   and dragging, releasing to finish it -- or with\n"
+            "   a quick click to start it, moving the mouse to\n"
+            "   aim it, and a second click to finish (Esc\n"
+            "   cancels a line started this way). Either way\n"
+            "   it's selected automatically and the known-\n"
+            "   length field above is focused, ready to type.\n"
             "3. Type its real-world length and press Enter\n"
             "   (or leave it blank -- nothing is required).\n"
             "4. Every other line of that color then shows\n"
@@ -358,14 +369,28 @@ class ImageMeasureApp:
     def _on_mode_change(self):
         self.dragging_vertex = None
         self.drag_start_img = None
+        self.cancel_click_draw()
         self.canvas.config(cursor="crosshair" if self.mode.get() == "draw" else "hand2")
         self._update_parallel_hint()
 
+    def cancel_click_draw(self, event=None):
+        """Escape, or switching modes: abandon a line that was started with
+        a short click and is waiting for the closing click."""
+        if self.click_draw_start is None:
+            return
+        self.click_draw_start = None
+        if self.drag_temp_id:
+            self.canvas.delete(self.drag_temp_id)
+            self.drag_temp_id = None
+        self.status.set("Line cancelled.")
+
     def cycle_color(self, direction=1):
-        """Tab/Shift+Tab switches the active line color (X -> Y -> Z -> X),
-        so you don't have to reach for the mouse mid-measurement. Left alone
-        while the known-length field has focus, so Tab still moves between
-        that field and its unit box normally."""
+        """Space bar switches the active line color (X -> Y -> Z -> X), so
+        you don't have to reach for the mouse mid-measurement. Left alone
+        while the known-length field (or its unit box) has focus -- typing
+        a length takes priority, and a space is meaningless in a number
+        anyway (see the entry's own <KeyPress-space> binding, which blocks
+        it from being typed at all)."""
         focused = self.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
             return None
@@ -413,6 +438,10 @@ class ImageMeasureApp:
         self.image_path = path
         self.pil_image = img.convert("RGB")
         self._build_pyramid()
+        self.dragging_vertex = None
+        self.drag_start_img = None
+        self.drag_temp_id = None
+        self.click_draw_start = None
         self.lines = []
         self.selected_line_ids = []
         self.project_path = None
@@ -484,6 +513,7 @@ class ImageMeasureApp:
         if not self.pil_image:
             messagebox.showinfo("No image", "Open an image first.")
             return
+        self.cancel_click_draw()
         old_h = self.pil_image.height
         self.pil_image = self.pil_image.transpose(Image.ROTATE_270)  # 90 deg clockwise
         self._build_pyramid()
@@ -650,6 +680,16 @@ class ImageMeasureApp:
     def on_canvas_press(self, event):
         if not self.pil_image:
             return
+
+        # A line started by a short click is waiting for its closing click --
+        # this press is that closing click, whatever mode we're in.
+        if self.click_draw_start is not None:
+            ix1, iy1 = self.click_draw_start
+            self.click_draw_start = None
+            ix2, iy2 = self.canvas_event_to_img(event)
+            self._finalize_line(ix1, iy1, ix2, iy2, bool(event.state & 0x0001))
+            return
+
         ix, iy = self.canvas_event_to_img(event)
         tol_img = HIT_TOLERANCE / self.scale
 
@@ -665,6 +705,8 @@ class ImageMeasureApp:
         # one you've got selected to draw with) or snaps a new line's start
         # to it (different color -- chaining a segment onto another axis).
         self.dragging_vertex = None
+        self.press_canvas = (event.x, event.y)
+        self.press_moved = False
         hit = self.find_vertex_near(ix, iy, tol_img)
         if hit:
             vline, vidx = hit
@@ -704,8 +746,21 @@ class ImageMeasureApp:
 
         if self.drag_start_img is None or self.mode.get() != "draw":
             return
-        ix1, iy1 = self.drag_start_img
-        sx, sy = self.img_to_canvas(ix1, iy1)   # re-derived at current scale/view
+
+        # Once the mouse has moved far enough, this press-and-hold counts as
+        # a drag (finalized on release, below); a release before crossing
+        # this threshold is a short click instead (see on_canvas_release).
+        if self.press_canvas is not None and \
+                dist((event.x, event.y), self.press_canvas) >= CLICK_MOVE_THRESHOLD:
+            self.press_moved = True
+
+        self._update_temp_line(*self.drag_start_img, event)
+
+    def _update_temp_line(self, ix1, iy1, event):
+        """Draw/update the dashed preview line from image point (ix1, iy1)
+        to the current cursor, applying the Shift-parallel constraint if
+        held. Shared by hold-and-drag drawing and click-to-click drawing."""
+        sx, sy = self.img_to_canvas(ix1, iy1)
         cx, cy = event.x, event.y
 
         if event.state & 0x0001:  # Shift held: constrain to parallel reference
@@ -723,10 +778,17 @@ class ImageMeasureApp:
                 sx, sy, cx, cy, fill=color_hex, width=2, dash=(4, 2))
 
     def on_canvas_hover(self, event):
-        """No button held: just update the cursor to hint what a click here
-        would do (move a vertex vs. snap-start a new line vs. plain draw)."""
+        """No button held. While a click-started line is pending, this is
+        what drives its live preview towards the cursor. Otherwise it just
+        updates the cursor to hint what a click here would do (move a
+        vertex vs. snap-start a new line vs. plain draw)."""
         if not self.pil_image or self.mode.get() != "draw":
             return
+
+        if self.click_draw_start is not None:
+            self._update_temp_line(*self.click_draw_start, event)
+            return
+
         ix, iy = self.canvas_to_img(event.x, event.y)
         tol_img = HIT_TOLERANCE / self.scale
         hit = self.find_vertex_near(ix, iy, tol_img)
@@ -753,22 +815,39 @@ class ImageMeasureApp:
             return
 
         ix1, iy1 = self.drag_start_img
+        self.drag_start_img = None
+
+        if not self.press_moved:
+            # A short click, not a drag: start a click-to-click line instead
+            # of finishing anything here. The preview line (if any -- it
+            # may not exist yet if the mouse never moved) keeps following
+            # the cursor via on_canvas_hover until the closing click, or
+            # Escape cancels it.
+            self.click_draw_start = (ix1, iy1)
+            self.status.set("Line started -- click again to finish it, "
+                             "or press Esc to cancel.")
+            return
+
+        ix2, iy2 = self.canvas_to_img(event.x, event.y)
+        self._finalize_line(ix1, iy1, ix2, iy2, bool(event.state & 0x0001))
+
+    def _finalize_line(self, ix1, iy1, ix2, iy2, shift_held):
+        """Create the new line from (ix1, iy1) to (ix2, iy2). Shared by the
+        hold-and-drag release and the click-to-click closing click."""
         if self.drag_temp_id:
             self.canvas.delete(self.drag_temp_id)
             self.drag_temp_id = None
 
-        ix2, iy2 = self.canvas_to_img(event.x, event.y)
         parallel_to = None
-
-        if event.state & 0x0001:  # Shift held
+        if shift_held:
             ref = self._parallel_reference()
             if ref:
                 ix2, iy2 = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 parallel_to = ref.id
 
-        self.drag_start_img = None
         if dist((ix1, iy1), (ix2, iy2)) < 3 / self.scale:
-            return  # treat as a click, not a line
+            self.status.set("Line too short -- not created.")
+            return
 
         color = self.current_color.get()
         line = Line(color, ix1, iy1, ix2, iy2, unit=self._last_unit_used(),
@@ -1030,6 +1109,10 @@ class ImageMeasureApp:
         self.image_path = img_path
         self.pil_image = img.convert("RGB")
         self._build_pyramid()
+        self.dragging_vertex = None
+        self.drag_start_img = None
+        self.drag_temp_id = None
+        self.click_draw_start = None
         self.lines = [Line.from_dict(d) for d in data.get("lines", [])]
         self.selected_line_ids = []
         self.project_path = path
