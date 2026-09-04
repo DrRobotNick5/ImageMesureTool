@@ -33,7 +33,7 @@ import json
 import math
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 
 try:
     from PIL import Image, ImageTk
@@ -108,57 +108,6 @@ class Line:
         return ln
 
 
-class CalibrateDialog(simpledialog.Dialog):
-    """Ask for a known real-world length + unit."""
-
-    def __init__(self, parent, title, initial_length=None, initial_unit="mm"):
-        self.initial_length = initial_length
-        self.initial_unit = initial_unit or "mm"
-        self.result_length = None
-        self.result_unit = None
-        super().__init__(parent, title=title)
-
-    def body(self, master):
-        ttk.Label(master, text="Known real-world length:").grid(
-            row=0, column=0, sticky="w", padx=4, pady=4)
-        self.length_var = tk.StringVar(
-            value="" if self.initial_length is None else str(self.initial_length))
-        self.length_entry = ttk.Entry(master, textvariable=self.length_var, width=14)
-        self.length_entry.grid(row=0, column=1, padx=4, pady=4)
-
-        ttk.Label(master, text="Unit:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
-        self.unit_var = tk.StringVar(value=self.initial_unit)
-        unit_box = ttk.Combobox(
-            master, textvariable=self.unit_var, width=12,
-            values=["mm", "cm", "m", "in", "ft", "px"])
-        unit_box.grid(row=1, column=1, padx=4, pady=4)
-
-        ttk.Label(master, text="Leave length blank to clear calibration.",
-                  foreground="#666").grid(row=2, column=0, columnspan=2,
-                                           sticky="w", padx=4, pady=(6, 0))
-        return self.length_entry
-
-    def validate(self):
-        text = self.length_var.get().strip()
-        if text == "":
-            self.result_length = None
-            self.result_unit = self.unit_var.get().strip() or "mm"
-            return True
-        try:
-            value = float(text)
-        except ValueError:
-            messagebox.showerror("Invalid length", "Enter a number, or leave it blank.",
-                                  parent=self)
-            return False
-        if value <= 0:
-            messagebox.showerror("Invalid length", "Length must be greater than 0.",
-                                  parent=self)
-            return False
-        self.result_length = value
-        self.result_unit = self.unit_var.get().strip() or "mm"
-        return True
-
-
 class ImageMeasureApp:
     def __init__(self, root):
         self.root = root
@@ -203,8 +152,10 @@ class ImageMeasureApp:
 
         editmenu = tk.Menu(menubar, tearoff=0)
         editmenu.add_command(label="Delete Selected Line(s)", command=self.delete_selected)
-        editmenu.add_command(label="Set Known Length...", command=self.calibrate_selected)
+        editmenu.add_command(label="Edit Known Length", command=self.focus_known_length)
         editmenu.add_command(label="Compare Selected Two Lines...", command=self.compare_selected)
+        editmenu.add_separator()
+        editmenu.add_command(label="Rotate Image 90°", command=self.rotate_image)
         menubar.add_cascade(label="Edit", menu=editmenu)
 
         helpmenu = tk.Menu(menubar, tearoff=0)
@@ -239,7 +190,6 @@ class ImageMeasureApp:
                          command=self._on_mode_change).pack(side="left")
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Set Known Length", command=self.calibrate_selected).pack(side="left", padx=2)
         ttk.Button(bar, text="Compare 2 Lines", command=self.compare_selected).pack(side="left", padx=2)
         ttk.Button(bar, text="Delete", command=self.delete_selected).pack(side="left", padx=2)
 
@@ -247,6 +197,7 @@ class ImageMeasureApp:
         ttk.Button(bar, text="Zoom In", command=lambda: self.zoom(1.25)).pack(side="left", padx=2)
         ttk.Button(bar, text="Zoom Out", command=lambda: self.zoom(0.8)).pack(side="left", padx=2)
         ttk.Button(bar, text="Fit", command=self.fit_to_window).pack(side="left", padx=2)
+        ttk.Button(bar, text="Rotate 90°", command=self.rotate_image).pack(side="left", padx=2)
 
         self.parallel_hint = ttk.Label(bar, text="", foreground="#a05a00")
         self.parallel_hint.pack(side="left", padx=10)
@@ -255,7 +206,12 @@ class ImageMeasureApp:
         body = ttk.Frame(self.root)
         body.pack(side="top", fill="both", expand=True)
 
-        # canvas + scrollbars
+        # side panel: known-length field + line list (on the LEFT)
+        side = ttk.Frame(body, padding=6, width=340)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+
+        # canvas + scrollbars (fills the rest of the window, to the right)
         canvas_frame = ttk.Frame(body)
         canvas_frame.pack(side="left", fill="both", expand=True)
 
@@ -276,10 +232,35 @@ class ImageMeasureApp:
         self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1))  # Linux scroll up
         self.canvas.bind("<Button-5>", lambda e: self.zoom(0.9))  # Linux scroll down
 
-        # side panel: line list
-        side = ttk.Frame(body, padding=6, width=340)
-        side.pack(side="right", fill="y")
-        side.pack_propagate(False)
+        # --- known-length entry, always visible, never a popup ---
+        known_frame = ttk.LabelFrame(side, text="Known length of selected line", padding=6)
+        known_frame.pack(fill="x", pady=(0, 8))
+
+        self.selection_label = ttk.Label(known_frame, text="No line selected",
+                                          foreground="#555")
+        self.selection_label.pack(anchor="w")
+
+        entry_row = ttk.Frame(known_frame)
+        entry_row.pack(fill="x", pady=(4, 0))
+        self.known_length_var = tk.StringVar(value="")
+        self.known_length_entry = ttk.Entry(entry_row, textvariable=self.known_length_var,
+                                             width=12, state="disabled")
+        self.known_length_entry.pack(side="left")
+        self.known_length_entry.bind("<Return>", self.commit_known_length)
+        self.known_length_entry.bind("<FocusOut>", self.commit_known_length)
+
+        self.known_unit_var = tk.StringVar(value="mm")
+        self.known_unit_box = ttk.Combobox(
+            entry_row, textvariable=self.known_unit_var, width=6, state="disabled",
+            values=["mm", "cm", "m", "in", "ft", "px"])
+        self.known_unit_box.pack(side="left", padx=(4, 0))
+        self.known_unit_box.bind("<<ComboboxSelected>>", self.commit_known_length)
+        self.known_unit_box.bind("<Return>", self.commit_known_length)
+
+        ttk.Label(known_frame, text="Type a value and press Enter. Leave blank for "
+                                     "no known length -- nothing is required.",
+                  foreground="#666", wraplength=300, justify="left").pack(
+            anchor="w", pady=(4, 0))
 
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
         columns = ("color", "axis", "px", "real", "calib")
@@ -293,7 +274,7 @@ class ImageMeasureApp:
             self.tree.column(col, width=width, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=4)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        self.tree.bind("<Double-1>", lambda e: self.calibrate_selected())
+        self.tree.bind("<Double-1>", lambda e: self.focus_known_length())
 
         axis_frame = ttk.LabelFrame(side, text="Axis calibration", padding=6)
         axis_frame.pack(fill="x", pady=8)
@@ -306,16 +287,21 @@ class ImageMeasureApp:
         help_text = (
             "How to measure:\n"
             "1. Pick a color (X/Y/Z) above.\n"
-            "2. Drag on the image to draw a line.\n"
-            "3. Enter its real-world length when prompted\n"
-            "   (or skip, and set it later).\n"
+            "2. Drag on the image to draw a line -- it's\n"
+            "   selected automatically and the known-length\n"
+            "   field above is focused and ready to type in.\n"
+            "3. Type its real-world length and press Enter\n"
+            "   (or leave it blank -- nothing is required).\n"
             "4. Every other line of that color then shows\n"
             "   a computed length automatically.\n\n"
             "Parallel: pick 'Draw parallel', click near an\n"
             "existing line, then drag elsewhere to add a\n"
             "new line locked to the same direction.\n\n"
             "Compare: select exactly two lines in the list\n"
-            "(Ctrl/Shift-click) and click 'Compare 2 Lines'."
+            "(Ctrl/Shift-click) and click 'Compare 2 Lines'.\n\n"
+            "Rotate 90° (toolbar) rotates the photo a quarter\n"
+            "turn and keeps every existing line attached to\n"
+            "the same spot on the image."
         )
         ttk.Label(side, text=help_text, foreground="#555", justify="left").pack(
             anchor="w", pady=(10, 0))
@@ -380,6 +366,21 @@ class ImageMeasureApp:
             self.zoom(1.1)
         else:
             self.zoom(0.9)
+
+    def rotate_image(self):
+        """Rotate the loaded image 90 degrees clockwise, keeping every
+        existing line attached to the same spot on the picture."""
+        if not self.pil_image:
+            messagebox.showinfo("No image", "Open an image first.")
+            return
+        old_h = self.pil_image.height
+        self.pil_image = self.pil_image.transpose(Image.ROTATE_270)  # 90 deg clockwise
+        for ln in self.lines:
+            ln.x1, ln.y1 = old_h - ln.y1, ln.x1
+            ln.x2, ln.y2 = old_h - ln.y2, ln.x2
+        self.fit_to_window()
+        self.redraw()
+        self.status.set("Rotated image 90 degrees.")
 
     def _render_image(self):
         iw, ih = self.pil_image.width, self.pil_image.height
@@ -535,17 +536,15 @@ class ImageMeasureApp:
 
         color = self.current_color.get() if parallel_to is None else \
             self._line_by_id(parallel_to).color
-        line = Line(color, ix1, iy1, ix2, iy2, parallel_to=parallel_to)
+        line = Line(color, ix1, iy1, ix2, iy2, unit=self._last_unit_used(),
+                    parallel_to=parallel_to)
         self.lines.append(line)
-        self.redraw()
-        self.select_line(line.id)
+        self.select_line(line.id)   # also redraws and populates the known-length field
 
-        dlg = CalibrateDialog(self.root, f"Known length for new {color} line?",
-                               initial_unit=self._last_unit_used())
-        if dlg.result_length is not None:
-            line.known_length = dlg.result_length
-            line.unit = dlg.result_unit
-            self.redraw()
+        # Ready for the user to immediately type the known length -- no popup,
+        # nothing required. Just focus the field with the cursor in place.
+        self.known_length_entry.focus_set()
+        self.known_length_entry.icursor("end")
 
         if self.mode.get() == "parallel":
             self.parallel_ref_id = None
@@ -604,8 +603,13 @@ class ImageMeasureApp:
                 fmt_len(real, unit) if real else "?",
                 "yes" if ln.known_length else "no",
             ))
+        # Mirrors self.selected_line_ids back onto the tree widget. This
+        # fires <<TreeviewSelect>> again, which on_tree_select short-circuits
+        # when nothing actually changed (see there) -- otherwise it's an
+        # infinite loop that freezes the app on the very first line drawn.
+        children = self.tree.get_children()
         for sel_id in self.selected_line_ids:
-            if str(sel_id) in self.tree.get_children():
+            if str(sel_id) in children:
                 self.tree.selection_add(str(sel_id))
 
     def _update_axis_labels(self):
@@ -631,26 +635,78 @@ class ImageMeasureApp:
         else:
             self.selected_line_ids = [line_id]
         self.redraw()
+        self.populate_known_length_field()
 
     def on_tree_select(self, event=None):
         sel = [int(i) for i in self.tree.selection()]
+        # _update_tree() below calls selection_add() to mirror our selection
+        # back onto the tree widget, which re-fires <<TreeviewSelect>> (Tk
+        # queues it, so a simple "are we already updating" flag can't catch
+        # it in time). If nothing actually changed, stop here -- otherwise
+        # this turns into an infinite redraw <-> selection_add loop that
+        # freezes the whole app the moment a line is drawn.
+        if set(sel) == set(self.selected_line_ids):
+            return
         self.selected_line_ids = sel
         self.redraw()
+        self.populate_known_length_field()
 
-    # -------------------------------------------------------------- actions
-    def calibrate_selected(self):
+    # ------------------------------------------------- known-length field
+    def populate_known_length_field(self):
+        """Refresh the always-visible known-length field for the current
+        selection. Enabled only when exactly one line is selected."""
+        if len(self.selected_line_ids) == 1:
+            ln = self._line_by_id(self.selected_line_ids[0])
+            if ln:
+                self.known_length_entry.config(state="normal")
+                self.known_unit_box.config(state="readonly")
+                self.known_length_var.set("" if ln.known_length is None else str(ln.known_length))
+                self.known_unit_var.set(ln.unit or self._last_unit_used())
+                self.selection_label.config(
+                    text=f"Line #{ln.id} ({ln.color}, {AXIS_COLORS[ln.color]['axis']}) "
+                         f"-- {ln.pixel_length():.1f} px")
+                return
+        self.known_length_var.set("")
+        self.known_length_entry.config(state="disabled")
+        self.known_unit_box.config(state="disabled")
+        if len(self.selected_line_ids) == 0:
+            self.selection_label.config(text="No line selected")
+        else:
+            self.selection_label.config(text=f"{len(self.selected_line_ids)} lines selected")
+
+    def commit_known_length(self, event=None):
+        """Apply whatever is currently typed in the known-length field to
+        the single selected line. Never required -- blank just clears it."""
         if len(self.selected_line_ids) != 1:
-            messagebox.showinfo("Select one line", "Select exactly one line first.")
             return
         ln = self._line_by_id(self.selected_line_ids[0])
         if not ln:
             return
-        dlg = CalibrateDialog(self.root, f"Known length for line #{ln.id} ({ln.color})",
-                               ln.known_length, ln.unit or self._last_unit_used())
-        ln.known_length = dlg.result_length
-        ln.unit = dlg.result_unit
+        text = self.known_length_var.get().strip()
+        if text == "":
+            ln.known_length = None
+        else:
+            try:
+                value = float(text)
+            except ValueError:
+                self.status.set("Known length must be a number (or leave it blank).")
+                return
+            if value <= 0:
+                self.status.set("Known length must be greater than 0.")
+                return
+            ln.known_length = value
+        ln.unit = self.known_unit_var.get().strip() or "mm"
         self.redraw()
+        self.populate_known_length_field()
 
+    def focus_known_length(self):
+        if len(self.selected_line_ids) != 1:
+            messagebox.showinfo("Select one line", "Select exactly one line first.")
+            return
+        self.known_length_entry.focus_set()
+        self.known_length_entry.selection_range(0, "end")
+
+    # -------------------------------------------------------------- actions
     def compare_selected(self):
         if len(self.selected_line_ids) != 2:
             messagebox.showinfo("Select two lines",
@@ -664,11 +720,13 @@ class ImageMeasureApp:
 
         a_real, a_unit = self.computed_length(a)
         if a_real is None:
-            dlg = CalibrateDialog(self.root, f"Known length for line #{a.id} ({a.color}) "
-                                              f"-- used as the reference for this comparison")
-            if dlg.result_length is None:
-                return
-            a_real, a_unit = dlg.result_length, dlg.result_unit
+            messagebox.showinfo(
+                "Known length needed",
+                f"Line #{a.id} ({a.color}) has no known length yet, and its axis "
+                "isn't calibrated either.\n\nSelect just that line, type its "
+                "known length into the field on the left, press Enter, then "
+                "try Compare again.")
+            return
 
         ratio = b.pixel_length() / a.pixel_length() if a.pixel_length() else 0
         b_real = a_real * ratio
@@ -775,9 +833,13 @@ class ImageMeasureApp:
     def show_help(self):
         messagebox.showinfo("How to use", (
             "1. File > Open Image to load a photo.\n"
-            "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line.\n"
-            "3. When prompted, type the real-world length that line represents "
-            "(e.g. a known object edge), or leave it blank.\n"
+            "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line. "
+            "It's selected automatically and the known-length field on the left "
+            "is focused, ready for you to type into.\n"
+            "3. Type the real-world length that line represents (e.g. a known "
+            "object edge) and press Enter, or leave it blank -- nothing is "
+            "required. You can always come back and edit it later by selecting "
+            "the line again.\n"
             "4. Once one line of a color has a known length, every other line of "
             "that same color shows a computed real-world length automatically -- "
             "shown on the canvas and in the side list.\n"
@@ -787,7 +849,9 @@ class ImageMeasureApp:
             "6. 'Draw parallel' mode: click near an existing line to lock its "
             "direction, then drag anywhere to add a new line guaranteed parallel "
             "to it.\n"
-            "7. Save Project keeps the image path + all lines in a .json file "
+            "7. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
+            "every line attached to the same spot on the image.\n"
+            "8. Save Project keeps the image path + all lines in a .json file "
             "you can reopen later. Export CSV for a spreadsheet of measurements."
         ))
 

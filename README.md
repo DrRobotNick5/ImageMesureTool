@@ -25,9 +25,14 @@ python image_measure_tool.py
   just labels for three independent axes you calibrate separately (e.g. red
   for horizontal, green for vertical, blue for depth) -- use them however
   makes sense for your shot.
-- Drag on the image to draw a line in the selected color. You'll be prompted
-  for its real-world length (any unit: mm/cm/m/in/ft/px). You can skip this
-  and fill it in later by selecting the line and clicking **Set Known Length**.
+- Drag on the image to draw a line in the selected color. It's selected
+  automatically and the **known length** field in the panel on the left is
+  focused, ready to type into -- no popup. Type a number and press Enter (any
+  unit: mm/cm/m/in/ft/px), or leave it blank; nothing is required, and you can
+  always come back later by clicking the line (or its row in the list below)
+  and typing into that same field.
+- **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
+  clockwise and keeps every line attached to the same spot on the picture.
 - Once one line of a color has a known length, every other line of that same
   color automatically shows a computed real-world length, both on the canvas
   and in the side list -- because the tool now knows that color's
@@ -57,4 +62,3 @@ python image_measure_tool.py
   calibration for the whole image.
 - Zoom with the mouse wheel or the Zoom In/Out/Fit buttons; scrollbars pan
   around when zoomed in, which helps with precise clicks on high-res photos.
-"# ImageMesureTool" 
