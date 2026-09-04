@@ -40,7 +40,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageOps
 except ImportError:
     raise SystemExit(
         "Pillow is required. Install it with:\n\n    pip install pillow\n"
@@ -128,6 +128,7 @@ class ImageMeasureApp:
 
         self.image_path = None
         self.pil_image = None            # original, full-res PIL image
+        self.pyramid = []                 # [(factor, PIL.Image), ...], full-res first
         self.tk_image = None              # scaled PhotoImage currently shown
         self.scale = 1.0                  # canvas px per image px
         self.view_x = 0.0                 # image-space coords shown at canvas (0, 0)
@@ -137,7 +138,7 @@ class ImageMeasureApp:
         self.selected_line_ids = []       # for compare / delete / calibrate
         self.current_color = tk.StringVar(value=DEFAULT_COLOR)
         self.mode = tk.StringVar(value="draw")   # 'draw' | 'select'
-        self.drag_start_canvas = None
+        self.drag_start_img = None        # (ix, iy) anchor for the line being drawn
         self.drag_temp_id = None
         self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
         self.project_path = None
@@ -149,6 +150,10 @@ class ImageMeasureApp:
 
         self.root.bind("<Delete>", lambda e: self.delete_selected())
         self.root.bind("<BackSpace>", lambda e: self.delete_selected())
+        self.root.bind("<Tab>", lambda e: self.cycle_color(1))
+        self.root.bind("<Shift-Tab>", lambda e: self.cycle_color(-1))
+        # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
+        self.root.bind("<ISO_Left_Tab>", lambda e: self.cycle_color(-1))
 
     # ---------------------------------------------------------- UI setup
     def _build_menu(self):
@@ -310,7 +315,8 @@ class ImageMeasureApp:
 
         help_text = (
             "How to measure:\n"
-            "1. Pick a color (X/Y/Z) above.\n"
+            "1. Pick a color (X/Y/Z) above, or press Tab to\n"
+            "   cycle it (Shift+Tab to go the other way).\n"
             "2. Drag on the image to draw a line -- it's\n"
             "   selected automatically and the known-length\n"
             "   field above is focused and ready to type in.\n"
@@ -351,9 +357,22 @@ class ImageMeasureApp:
 
     def _on_mode_change(self):
         self.dragging_vertex = None
-        self.drag_start_canvas = None
+        self.drag_start_img = None
         self.canvas.config(cursor="crosshair" if self.mode.get() == "draw" else "hand2")
         self._update_parallel_hint()
+
+    def cycle_color(self, direction=1):
+        """Tab/Shift+Tab switches the active line color (X -> Y -> Z -> X),
+        so you don't have to reach for the mouse mid-measurement. Left alone
+        while the known-length field has focus, so Tab still moves between
+        that field and its unit box normally."""
+        focused = self.root.focus_get()
+        if focused in (self.known_length_entry, self.known_unit_box):
+            return None
+        colors = list(AXIS_COLORS.keys())
+        idx = colors.index(self.current_color.get())
+        self.current_color.set(colors[(idx + direction) % len(colors)])
+        return "break"
 
     # ------------------------------------------------------------- image
     def open_image(self):
@@ -379,12 +398,21 @@ class ImageMeasureApp:
     def _load_image_path(self, path):
         try:
             img = Image.open(path)
+            # Cameras/phones store landscape pixel data plus an EXIF
+            # "Orientation" tag saying how to rotate/flip it for display.
+            # Windows (and every normal photo viewer) reads that tag; PIL's
+            # raw pixels don't, which is why an image can come in sideways
+            # here even though Explorer shows it upright. This applies the
+            # same correction Windows does, then discards the tag so it
+            # isn't applied twice.
+            img = ImageOps.exif_transpose(img)
             img.load()
         except Exception as exc:
             messagebox.showerror("Could not open image", str(exc))
             return
         self.image_path = path
         self.pil_image = img.convert("RGB")
+        self._build_pyramid()
         self.lines = []
         self.selected_line_ids = []
         self.project_path = None
@@ -458,6 +486,7 @@ class ImageMeasureApp:
             return
         old_h = self.pil_image.height
         self.pil_image = self.pil_image.transpose(Image.ROTATE_270)  # 90 deg clockwise
+        self._build_pyramid()
         for ln in self.lines:
             ln.x1, ln.y1 = old_h - ln.y1, ln.x1
             ln.x2, ln.y2 = old_h - ln.y2, ln.x2
@@ -465,17 +494,44 @@ class ImageMeasureApp:
         self.redraw()
         self.status.set("Rotated image 90 degrees.")
 
+    def _build_pyramid(self):
+        """Precompute progressively half-sized versions of the loaded image.
+        Zoomed way out, cropping straight from the full-resolution original
+        and downsizing it (even with a fast filter) still costs time
+        proportional to the WHOLE image's pixel count, on every single
+        zoom/pan step -- that's what caused the lag when zooming out on a
+        large photo. Picking the smallest pyramid level that's still
+        sharp enough for the current zoom keeps the per-frame cost bounded
+        by the canvas size instead, at any zoom level."""
+        levels = [(1.0, self.pil_image)]
+        img = self.pil_image
+        factor = 1.0
+        while img.width > 64 and img.height > 64 and len(levels) < 14:
+            img = img.reduce(2)  # fast box-filter halving
+            factor /= 2.0
+            levels.append((factor, img))
+        self.pyramid = levels
+
+    def _pick_pyramid_level(self, scale):
+        """The lowest-resolution pyramid level that's still >= scale (i.e.
+        the smallest source image that doesn't need to be upscaled)."""
+        for factor, img in reversed(self.pyramid):
+            if factor >= scale:
+                return factor, img
+        return self.pyramid[0]
+
     def _render_image(self):
         """Draw only the part of the image that's actually visible, resized
-        to fit the canvas. However far you're zoomed in, this never resizes
-        more pixels than the canvas itself has -- that's what keeps zooming
-        into a large photo fast (resizing the *whole* image at high zoom is
-        what caused the lag)."""
+        to fit the canvas, using whichever pyramid level is just sharp
+        enough for the current zoom. However far you're zoomed in or out,
+        this never resizes more source pixels than the canvas itself has
+        room for -- that's what keeps zooming smooth regardless of the
+        original photo's resolution."""
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
         iw, ih = self.pil_image.width, self.pil_image.height
 
-        # visible region, in image-space coordinates
+        # visible region, in ORIGINAL image-space coordinates
         vx0, vy0 = self.view_x, self.view_y
         vx1, vy1 = self.view_x + cw / self.scale, self.view_y + ch / self.scale
 
@@ -485,12 +541,15 @@ class ImageMeasureApp:
 
         canvas_img = Image.new("RGB", (cw, ch), (43, 43, 43))
         if cx1 > cx0 and cy1 > cy0:
-            crop = self.pil_image.crop(
-                (int(cx0), int(cy0), math.ceil(cx1), math.ceil(cy1)))
+            factor, src_img = self._pick_pyramid_level(self.scale)
+            # same crop rect, translated into that pyramid level's own pixels
+            lx0, ly0 = max(0, cx0 * factor), max(0, cy0 * factor)
+            lx1 = min(src_img.width, cx1 * factor)
+            ly1 = min(src_img.height, cy1 * factor)
+            crop = src_img.crop((int(lx0), int(ly0), math.ceil(lx1), math.ceil(ly1)))
             out_w = max(1, round((cx1 - cx0) * self.scale))
             out_h = max(1, round((cy1 - cy0) * self.scale))
-            resample = Image.LANCZOS if self.scale <= 1 else Image.BILINEAR
-            resized = crop.resize((out_w, out_h), resample)
+            resized = crop.resize((out_w, out_h), Image.LANCZOS)
             paste_x = round((cx0 - self.view_x) * self.scale)
             paste_y = round((cy0 - self.view_y) * self.scale)
             canvas_img.paste(resized, (paste_x, paste_y))
@@ -611,15 +670,22 @@ class ImageMeasureApp:
             vline, vidx = hit
             if vline.color == self.current_color.get():
                 self.dragging_vertex = (vline, vidx)
-                self.drag_start_canvas = None
+                self.drag_start_img = None
                 self.select_line(vline.id)
                 return
             vx, vy = (vline.x1, vline.y1) if vidx == 1 else (vline.x2, vline.y2)
-            self.drag_start_canvas = self.img_to_canvas(vx, vy)
+            self.drag_start_img = (vx, vy)
             self.drag_temp_id = None
             return
 
-        self.drag_start_canvas = (event.x, event.y)
+        # Store the start point in IMAGE space, not canvas space -- if you
+        # zoom or middle-mouse-pan while still holding the button down, the
+        # canvas pixel under your original click no longer corresponds to
+        # the same spot on the photo. Re-deriving the canvas position fresh
+        # from the image-space anchor on every drag/release call (below)
+        # keeps the line's start point pinned to the actual photo content
+        # instead of stretching to wherever that canvas pixel ended up.
+        self.drag_start_img = (ix, iy)
         self.drag_temp_id = None
 
     def on_canvas_drag(self, event):
@@ -636,15 +702,15 @@ class ImageMeasureApp:
             self.redraw()
             return
 
-        if self.drag_start_canvas is None or self.mode.get() != "draw":
+        if self.drag_start_img is None or self.mode.get() != "draw":
             return
+        ix1, iy1 = self.drag_start_img
+        sx, sy = self.img_to_canvas(ix1, iy1)   # re-derived at current scale/view
         cx, cy = event.x, event.y
-        sx, sy = self.drag_start_canvas
 
         if event.state & 0x0001:  # Shift held: constrain to parallel reference
             ref = self._parallel_reference()
             if ref:
-                ix1, iy1 = self.canvas_to_img(sx, sy)
                 ix2, iy2 = self.canvas_to_img(cx, cy)
                 ex, ey = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 cx, cy = self.img_to_canvas(ex, ey)
@@ -682,18 +748,16 @@ class ImageMeasureApp:
             self.status.set(f"Moved line #{ln.id}'s endpoint.")
             return
 
-        if self.drag_start_canvas is None or self.mode.get() != "draw":
-            self.drag_start_canvas = None
+        if self.drag_start_img is None or self.mode.get() != "draw":
+            self.drag_start_img = None
             return
 
-        cx, cy = event.x, event.y
-        sx, sy = self.drag_start_canvas
+        ix1, iy1 = self.drag_start_img
         if self.drag_temp_id:
             self.canvas.delete(self.drag_temp_id)
             self.drag_temp_id = None
 
-        ix1, iy1 = self.canvas_to_img(sx, sy)
-        ix2, iy2 = self.canvas_to_img(cx, cy)
+        ix2, iy2 = self.canvas_to_img(event.x, event.y)
         parallel_to = None
 
         if event.state & 0x0001:  # Shift held
@@ -702,7 +766,7 @@ class ImageMeasureApp:
                 ix2, iy2 = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 parallel_to = ref.id
 
-        self.drag_start_canvas = None
+        self.drag_start_img = None
         if dist((ix1, iy1), (ix2, iy2)) < 3 / self.scale:
             return  # treat as a click, not a line
 
@@ -961,9 +1025,11 @@ class ImageMeasureApp:
             if not img_path:
                 return
         img = Image.open(img_path)
+        img = ImageOps.exif_transpose(img)  # match how _load_image_path opens it
         img.load()
         self.image_path = img_path
         self.pil_image = img.convert("RGB")
+        self._build_pyramid()
         self.lines = [Line.from_dict(d) for d in data.get("lines", [])]
         self.selected_line_ids = []
         self.project_path = path

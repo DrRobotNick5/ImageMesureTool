@@ -24,10 +24,14 @@ python image_measure_tool.py
 ## How it works
 
 - **File > Open Image** loads a photo, or just drag an image file onto the
-  window (needs `tkinterdnd2` -- see Setup).
-- Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z**. These are
-  just labels for three independent axes you calibrate separately (e.g. red
-  for horizontal, green for vertical, blue for depth) -- use them however
+  window (needs `tkinterdnd2` -- see Setup). A photo from a phone or camera
+  that comes in sideways is automatically rotated to match how Windows/Photos
+  displays it (both read the same EXIF orientation tag in the file).
+- Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
+  press **Tab** to cycle to the next color (**Shift+Tab** for the previous
+  one), so you don't have to reach for the mouse between measurements. These
+  are just labels for three independent axes you calibrate separately (e.g.
+  red for horizontal, green for vertical, blue for depth) -- use them however
   makes sense for your shot.
 - Drag on the image to draw a line in the selected color. It's selected
   automatically and the **known length** field in the panel on the left is
@@ -75,5 +79,11 @@ python image_measure_tool.py
 - Scroll the mouse wheel to zoom in/out towards wherever your cursor is
   pointing (or use the Zoom In/Out/Fit toolbar buttons, which zoom towards
   the center). Hold the **middle mouse button** and drag to pan. Only the
-  portion of the photo actually visible on screen gets resized each frame,
-  so zooming in tight on a large photo stays smooth instead of lagging.
+  portion of the photo actually visible on screen gets resized each frame --
+  and zooming out uses a pre-shrunk version of the photo instead of
+  downsizing the full-resolution original every frame -- so both zooming in
+  tight and zooming way out on a large photo stay smooth.
+- If you zoom or pan (scroll wheel / middle-mouse drag) in the middle of
+  dragging out a new line, the line's start point stays pinned to the actual
+  spot on the photo you clicked, instead of stretching to wherever that
+  screen pixel ended up.
