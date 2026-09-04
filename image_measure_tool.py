@@ -20,10 +20,14 @@ A Tkinter desktop app for measuring things in a photo.
   parallel edges (e.g. opposite sides of a box) from a single photo.
 - Save/load your work as a .json project file next to the image, and
   export all measurements to CSV.
+- Scroll to zoom in on your cursor, hold the middle mouse button to pan,
+  and drag an image file onto the window to open it.
 
 Requires: Python 3.8+, Pillow (pip install pillow). Tkinter ships with
 the standard Windows/macOS Python installers; on Linux install your
-distro's python3-tk package if it's missing.
+distro's python3-tk package if it's missing. Drag-and-drop needs the
+optional tkinterdnd2 package (pip install tkinterdnd2) -- without it,
+everything else still works, you just use File > Open Image instead.
 
 Run:
     python image_measure_tool.py
@@ -41,6 +45,14 @@ except ImportError:
     raise SystemExit(
         "Pillow is required. Install it with:\n\n    pip install pillow\n"
     )
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 AXIS_COLORS = {
     "red": {"axis": "X", "hex": "#e53935", "select_hex": "#ff8a80"},
@@ -118,6 +130,9 @@ class ImageMeasureApp:
         self.pil_image = None            # original, full-res PIL image
         self.tk_image = None              # scaled PhotoImage currently shown
         self.scale = 1.0                  # canvas px per image px
+        self.view_x = 0.0                 # image-space coords shown at canvas (0, 0)
+        self.view_y = 0.0
+        self.pan_start = None             # (canvas_x, canvas_y, view_x, view_y) mid-drag
         self.lines = []                   # list[Line]
         self.selected_line_ids = []       # for compare / delete / calibrate
         self.current_color = tk.StringVar(value=DEFAULT_COLOR)
@@ -211,26 +226,36 @@ class ImageMeasureApp:
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
 
-        # canvas + scrollbars (fills the rest of the window, to the right)
+        # canvas (fills the rest of the window, to the right). No scrollbars --
+        # panning is done by dragging with the middle mouse button, and only
+        # the visible region is ever rendered (see _render_image), which is
+        # what keeps zooming in on a big photo from lagging.
         canvas_frame = ttk.Frame(body)
         canvas_frame.pack(side="left", fill="both", expand=True)
 
-        self.canvas = tk.Canvas(canvas_frame, bg="#2b2b2b", cursor="crosshair")
-        hbar = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
-        vbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.grid(row=1, column=0, sticky="ew")
-        canvas_frame.rowconfigure(0, weight=1)
-        canvas_frame.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(canvas_frame, bg="#2b2b2b", cursor="crosshair",
+                                 highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)      # Windows/macOS
-        self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1))  # Linux scroll up
-        self.canvas.bind("<Button-5>", lambda e: self.zoom(0.9))  # Linux scroll down
+        self.canvas.bind("<Button-4>", lambda e: self.zoom(1.1, e.x, e.y))  # Linux scroll up
+        self.canvas.bind("<Button-5>", lambda e: self.zoom(0.9, e.x, e.y))  # Linux scroll down
+        self.canvas.bind("<ButtonPress-2>", self.on_pan_start)     # middle-mouse pan
+        self.canvas.bind("<B2-Motion>", self.on_pan_drag)
+        self.canvas.bind("<ButtonRelease-2>", self.on_pan_end)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
+
+        self.dnd_active = False
+        if DND_AVAILABLE:
+            try:
+                self.canvas.drop_target_register(DND_FILES)
+                self.canvas.dnd_bind("<<Drop>>", self.on_drop_file)
+                self.dnd_active = True
+            except tk.TclError:
+                pass  # root wasn't a TkinterDnD.Tk() -- drag-and-drop stays off
 
         # --- known-length entry, always visible, never a popup ---
         known_frame = ttk.LabelFrame(side, text="Known length of selected line", padding=6)
@@ -301,13 +326,19 @@ class ImageMeasureApp:
             "(Ctrl/Shift-click) and click 'Compare 2 Lines'.\n\n"
             "Rotate 90° (toolbar) rotates the photo a quarter\n"
             "turn and keeps every existing line attached to\n"
-            "the same spot on the image."
+            "the same spot on the image.\n\n"
+            "Drag an image file onto the canvas to open it"
+            + ("." if self.dnd_active else " (run: pip install tkinterdnd2).") + "\n"
+            "Scroll wheel zooms in on your cursor. Hold the\n"
+            "middle mouse button and drag to pan."
         )
         ttk.Label(side, text=help_text, foreground="#555", justify="left").pack(
             anchor="w", pady=(10, 0))
 
     def _build_statusbar(self):
-        self.status = tk.StringVar(value="Open an image to begin (File > Open Image).")
+        msg = "Open an image to begin (File > Open Image"
+        msg += " or drag one onto the canvas)." if self.dnd_active else ")."
+        self.status = tk.StringVar(value=msg)
         bar = ttk.Label(self.root, textvariable=self.status, anchor="w",
                          relief="sunken", padding=(6, 2))
         bar.pack(side="bottom", fill="x")
@@ -328,6 +359,20 @@ class ImageMeasureApp:
                        ("All files", "*.*")])
         if not path:
             return
+        self._load_image_path(path)
+
+    def on_drop_file(self, event):
+        # event.data may be one path, or several space-separated and
+        # brace-quoted (e.g. "{C:/a b/img.jpg} {C:/other.png}") -- splitlist
+        # understands that Tcl-list quoting.
+        paths = self.canvas.tk.splitlist(event.data)
+        for path in paths:
+            if path.lower().endswith(IMAGE_EXTS):
+                self._load_image_path(path)
+                return
+        messagebox.showinfo("Not an image", "Drop an image file (jpg/png/bmp/tif/webp).")
+
+    def _load_image_path(self, path):
         try:
             img = Image.open(path)
             img.load()
@@ -353,19 +398,53 @@ class ImageMeasureApp:
         ch = max(self.canvas.winfo_height(), 300)
         iw, ih = self.pil_image.width, self.pil_image.height
         self.scale = min(cw / iw, ch / ih, 1.0) or 1.0
+        # center the image in the canvas
+        self.view_x = iw / 2 - (cw / 2) / self.scale
+        self.view_y = ih / 2 - (ch / 2) / self.scale
         self._render_image()
 
-    def zoom(self, factor):
+    def zoom(self, factor, canvas_x=None, canvas_y=None):
+        """Zoom in/out, keeping the image point under (canvas_x, canvas_y)
+        fixed on screen -- i.e. zoom towards the cursor. Defaults to the
+        canvas center when no cursor position is given (toolbar buttons)."""
         if not self.pil_image:
             return
-        self.scale = max(0.05, min(8.0, self.scale * factor))
+        if canvas_x is None:
+            canvas_x = self.canvas.winfo_width() / 2
+        if canvas_y is None:
+            canvas_y = self.canvas.winfo_height() / 2
+        ix, iy = self.canvas_to_img(canvas_x, canvas_y)
+        new_scale = max(0.02, min(16.0, self.scale * factor))
+        if new_scale == self.scale:
+            return
+        self.scale = new_scale
+        self.view_x = ix - canvas_x / self.scale
+        self.view_y = iy - canvas_y / self.scale
         self._render_image()
 
     def on_mousewheel(self, event):
-        if event.delta > 0:
-            self.zoom(1.1)
-        else:
-            self.zoom(0.9)
+        factor = 1.1 if event.delta > 0 else 0.9
+        self.zoom(factor, event.x, event.y)
+
+    def on_pan_start(self, event):
+        if not self.pil_image:
+            return
+        self.pan_start = (event.x, event.y, self.view_x, self.view_y)
+
+    def on_pan_drag(self, event):
+        if self.pan_start is None:
+            return
+        sx, sy, start_vx, start_vy = self.pan_start
+        self.view_x = start_vx - (event.x - sx) / self.scale
+        self.view_y = start_vy - (event.y - sy) / self.scale
+        self._render_image()
+
+    def on_pan_end(self, event):
+        self.pan_start = None
+
+    def on_canvas_resize(self, event):
+        if self.pil_image:
+            self._render_image()
 
     def rotate_image(self):
         """Rotate the loaded image 90 degrees clockwise, keeping every
@@ -383,26 +462,49 @@ class ImageMeasureApp:
         self.status.set("Rotated image 90 degrees.")
 
     def _render_image(self):
+        """Draw only the part of the image that's actually visible, resized
+        to fit the canvas. However far you're zoomed in, this never resizes
+        more pixels than the canvas itself has -- that's what keeps zooming
+        into a large photo fast (resizing the *whole* image at high zoom is
+        what caused the lag)."""
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
         iw, ih = self.pil_image.width, self.pil_image.height
-        sw, sh = max(1, int(iw * self.scale)), max(1, int(ih * self.scale))
-        resized = self.pil_image.resize((sw, sh), Image.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(resized)
+
+        # visible region, in image-space coordinates
+        vx0, vy0 = self.view_x, self.view_y
+        vx1, vy1 = self.view_x + cw / self.scale, self.view_y + ch / self.scale
+
+        # clamp to the actual image bounds
+        cx0, cy0 = max(vx0, 0), max(vy0, 0)
+        cx1, cy1 = min(vx1, iw), min(vy1, ih)
+
+        canvas_img = Image.new("RGB", (cw, ch), (43, 43, 43))
+        if cx1 > cx0 and cy1 > cy0:
+            crop = self.pil_image.crop(
+                (int(cx0), int(cy0), math.ceil(cx1), math.ceil(cy1)))
+            out_w = max(1, round((cx1 - cx0) * self.scale))
+            out_h = max(1, round((cy1 - cy0) * self.scale))
+            resample = Image.LANCZOS if self.scale <= 1 else Image.BILINEAR
+            resized = crop.resize((out_w, out_h), resample)
+            paste_x = round((cx0 - self.view_x) * self.scale)
+            paste_y = round((cy0 - self.view_y) * self.scale)
+            canvas_img.paste(resized, (paste_x, paste_y))
+
+        self.tk_image = ImageTk.PhotoImage(canvas_img)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image, tags=("bg",))
-        self.canvas.config(scrollregion=(0, 0, sw, sh))
         self.redraw()
 
     # ------------------------------------------------------- coord helpers
     def img_to_canvas(self, x, y):
-        return x * self.scale, y * self.scale
+        return (x - self.view_x) * self.scale, (y - self.view_y) * self.scale
 
     def canvas_to_img(self, x, y):
-        return x / self.scale, y / self.scale
+        return x / self.scale + self.view_x, y / self.scale + self.view_y
 
     def canvas_event_to_img(self, event):
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        return self.canvas_to_img(cx, cy)
+        return self.canvas_to_img(event.x, event.y)
 
     # -------------------------------------------------------- axis scale
     def axis_scale(self, color):
@@ -472,7 +574,7 @@ class ImageMeasureApp:
                 return
             # reference already chosen: fall through to start a drag
 
-        self.drag_start_canvas = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.drag_start_canvas = (event.x, event.y)
         self.drag_temp_id = None
 
     def on_canvas_drag(self, event):
@@ -480,7 +582,7 @@ class ImageMeasureApp:
             return
         if self.mode.get() not in ("draw", "parallel"):
             return
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        cx, cy = event.x, event.y
         sx, sy = self.drag_start_canvas
 
         if self.mode.get() == "parallel" and self.parallel_ref_id is not None:
@@ -510,7 +612,7 @@ class ImageMeasureApp:
             self.drag_start_canvas = None
             return
 
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        cx, cy = event.x, event.y
         sx, sy = self.drag_start_canvas
         if self.drag_temp_id:
             self.canvas.delete(self.drag_temp_id)
@@ -857,7 +959,7 @@ class ImageMeasureApp:
 
 
 def main():
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
     try:
         ttk.Style().theme_use("clam")
     except tk.TclError:

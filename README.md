@@ -6,11 +6,14 @@ color-coding, cross-line comparisons, and parallel-line drawing.
 ## Setup
 
 ```
-pip install pillow
+pip install pillow tkinterdnd2
 ```
 
-(Tkinter ships with the standard Python installer on Windows/macOS. On Linux,
-install your distro's `python3-tk` package if `import tkinter` fails.)
+`tkinterdnd2` is optional and only enables dragging an image file onto the
+window to open it -- everything else works without it, you'd just use
+File > Open Image instead. (Tkinter ships with the standard Python installer
+on Windows/macOS. On Linux, install your distro's `python3-tk` package if
+`import tkinter` fails.)
 
 ## Run
 
@@ -20,7 +23,8 @@ python image_measure_tool.py
 
 ## How it works
 
-- **File > Open Image** loads a photo.
+- **File > Open Image** loads a photo, or just drag an image file onto the
+  window (needs `tkinterdnd2` -- see Setup).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z**. These are
   just labels for three independent axes you calibrate separately (e.g. red
   for horizontal, green for vertical, blue for depth) -- use them however
@@ -60,5 +64,8 @@ python image_measure_tool.py
   strong perspective, calibrate a red/green/blue reference line *close to*
   each set of lines you're measuring with that axis, rather than one
   calibration for the whole image.
-- Zoom with the mouse wheel or the Zoom In/Out/Fit buttons; scrollbars pan
-  around when zoomed in, which helps with precise clicks on high-res photos.
+- Scroll the mouse wheel to zoom in/out towards wherever your cursor is
+  pointing (or use the Zoom In/Out/Fit toolbar buttons, which zoom towards
+  the center). Hold the **middle mouse button** and drag to pan. Only the
+  portion of the photo actually visible on screen gets resized each frame,
+  so zooming in tight on a large photo stays smooth instead of lagging.
