@@ -29,7 +29,7 @@ so you can have several photos/projects open at once.
   ones you never explicitly saved -- is remembered automatically and
   restored the next time you launch the app (see SESSION_PATH below).
 - Scroll to zoom in on your cursor, hold the middle mouse button to pan,
-  and drag an image file onto a tab to open it.
+  and drag an image OR project (.imt) file onto a tab to open it.
 
 Requires: Python 3.8+, Pillow (pip install pillow). Tkinter ships with
 the standard Windows/macOS Python installers; on Linux install your
@@ -107,6 +107,22 @@ def _session_dir():
 
 SESSION_PATH = os.path.join(_session_dir(), "session.json")
 SESSION_AUTOSAVE_MS = 60_000  # also save periodically, in case of a crash
+
+
+def _embedded_bytes_from_project_file(path):
+    """Best-effort peek into a .imt project file for just its embedded
+    image copy, without going through the full ProjectTab.load_project_data
+    flow (used to rescue a session-restored tab whose image has moved, when
+    that tab was also ever saved as a project). Returns None on any problem
+    -- this is a fallback, never something the caller should have to
+    handle exceptions for."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        b64 = data.get("image_data")
+        return base64.b64decode(b64) if b64 else None
+    except Exception:
+        return None
 
 
 def dist(p, q):
@@ -414,10 +430,12 @@ class ProjectTab(ttk.Frame):
             lbl.pack(anchor="w")
             self.axis_labels[color] = lbl
 
-        self.placeholder_label = ttk.Label(
-            self.canvas, text="Open an image, or drag one onto this tab"
-            + ("." if self.dnd_active else " (drag-and-drop needs: pip install tkinterdnd2)."),
-            foreground="#aaaaaa", background="#2b2b2b")
+        # The empty-tab hint is drawn as canvas TEXT, not a separate widget
+        # placed on top of the canvas. A widget placed there (e.g. a plain
+        # ttk.Label via .place()) sits right where you'd naturally drop a
+        # file onto a blank tab, and isn't itself a registered drop target --
+        # so the drop lands on the label and is silently swallowed instead
+        # of reaching the canvas's <<Drop>> binding below.
 
     def is_blank(self):
         return self.pil_image is None
@@ -431,11 +449,16 @@ class ProjectTab(ttk.Frame):
             self.app.update_tab_title(self)
 
     def _clear_placeholder(self):
-        self.placeholder_label.place_forget()
+        self.canvas.delete("placeholder")
 
     def _show_placeholder(self):
         self.canvas.delete("all")
-        self.placeholder_label.place(relx=0.5, rely=0.5, anchor="center")
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        text = "Open an image or project, or drag one onto this tab."
+        self.canvas.create_text(cw / 2, ch / 2, text=text, fill="#aaaaaa",
+                                 justify="center", width=max(200, cw - 40),
+                                 tags=("placeholder",))
 
     # ------------------------------------------------------------- image
     def on_drop_file(self, event):
@@ -444,10 +467,16 @@ class ProjectTab(ttk.Frame):
         # understands that Tcl-list quoting.
         paths = self.canvas.tk.splitlist(event.data)
         for path in paths:
-            if path.lower().endswith(IMAGE_EXTS):
+            lower = path.lower()
+            if lower.endswith(PROJECT_EXT) or lower.endswith(LEGACY_PROJECT_EXT):
+                self.app.handle_dropped_project(self, path)
+                return
+            if lower.endswith(IMAGE_EXTS):
                 self.app.handle_dropped_file(self, path)
                 return
-        messagebox.showinfo("Not an image", "Drop an image file (jpg/png/bmp/tif/webp).")
+        messagebox.showinfo("Not recognized",
+                             "Drop an image file (jpg/png/bmp/tif/webp) or a project "
+                             f"file ({PROJECT_EXT}).")
 
     def _apply_loaded_bytes(self, raw_bytes, rotation_turns=0):
         """Build self.pil_image (+ pyramid) from raw image FILE bytes --
@@ -580,6 +609,8 @@ class ProjectTab(ttk.Frame):
     def on_canvas_resize(self, event):
         if self.pil_image:
             self._render_image()
+        else:
+            self._show_placeholder()
 
     def rotate_image(self):
         """Rotate the loaded image 90 degrees clockwise, keeping every
@@ -1438,7 +1469,7 @@ class App:
         self.parallel_hint.pack(side="left", padx=10)
 
     def _build_statusbar(self):
-        self.status_var = tk.StringVar(value="Open an image to begin (File > Open Image, "
+        self.status_var = tk.StringVar(value="Open an image or project to begin (File menu, "
                                                "Ctrl+O, or drag one onto a tab).")
         bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w",
                          relief="sunken", padding=(6, 2))
@@ -1601,6 +1632,9 @@ class App:
     def handle_dropped_file(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_image_path(path), prefer_tab=source_tab)
 
+    def handle_dropped_project(self, source_tab, path):
+        self._open_into_tab(lambda tab: tab.load_project_data(path), prefer_tab=source_tab)
+
     # -------------------------------------------------------------- session
     def _all_tabs(self):
         return [self.notebook.nametowidget(w) for w in self.notebook.tabs()]
@@ -1632,28 +1666,60 @@ class App:
             return False
 
         restored_any = False
+        notes = []
         for entry in data.get("tabs", []):
             tab = ProjectTab(self.notebook, self)
             title = "Untitled"
             img_path = entry.get("image_path")
+            project_path = entry.get("project_path")
+            rotation_turns = entry.get("rotation_turns", 0)
+
+            # Get the image's raw bytes from wherever they're still available:
+            # the live file first, and -- if that's gone (moved/deleted) but
+            # this tab was ever saved as a project -- the copy embedded in
+            # that .imt file, same as opening the project directly would.
+            raw = None
+            recovered_via_project = False
             if img_path and os.path.exists(img_path):
-                ok = tab.load_image_path(
-                    img_path, rotation_turns=entry.get("rotation_turns", 0), silent=True)
-                if ok:
-                    tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
-                    tab.project_path = entry.get("project_path")
-                    if entry.get("scale"):
-                        tab.scale = entry["scale"]
-                        tab.view_x = entry.get("view_x", tab.view_x)
-                        tab.view_y = entry.get("view_y", tab.view_y)
-                        tab._render_image()
-                    else:
-                        tab.fit_to_window()
-                    tab.dirty = False
-                    tab.redraw()
-                    title = tab.display_name()
+                try:
+                    with open(img_path, "rb") as f:
+                        raw = f.read()
+                except Exception:
+                    raw = None
+            if raw is None and project_path and os.path.exists(project_path):
+                raw = _embedded_bytes_from_project_file(project_path)
+                recovered_via_project = raw is not None
+
+            ok = False
+            if raw is not None:
+                try:
+                    tab._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
+                    ok = True
+                except Exception:
+                    ok = False
+
+            if ok:
+                tab.image_path = img_path
+                tab.project_path = project_path
+                tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
+                tab.selected_line_ids = []
+                if entry.get("scale"):
+                    tab.scale = entry["scale"]
+                    tab.view_x = entry.get("view_x", tab.view_x)
+                    tab.view_y = entry.get("view_y", tab.view_y)
+                    tab._render_image()
+                else:
+                    tab.fit_to_window()
+                tab.dirty = False
+                tab._clear_placeholder()
+                tab.redraw()
+                title = tab.display_name()
+                self.update_tab_title(tab)
+                if recovered_via_project:
+                    notes.append(f"'{title}' had moved -- recovered from its saved project file")
             elif img_path:
-                self.set_status(f"Previously open image no longer found, skipped: {img_path}")
+                notes.append(f"couldn't find '{os.path.basename(img_path)}' -- that tab is blank")
+
             self.notebook.add(tab, text=title)
             restored_any = True
 
@@ -1662,7 +1728,10 @@ class App:
             tabs = self.notebook.tabs()
             if 0 <= idx < len(tabs):
                 self.notebook.select(tabs[idx])
-            self.set_status(f"Restored {len(tabs)} tab(s) from your last session.")
+            msg = f"Restored {len(tabs)} tab(s) from your last session."
+            if notes:
+                msg += " " + "; ".join(notes) + "."
+            self.set_status(msg)
         return restored_any
 
     def _periodic_autosave(self):

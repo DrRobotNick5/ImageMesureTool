@@ -33,9 +33,9 @@ python image_measure_tool.py
   file, closing it asks you to confirm first.
 - The color/mode toolbar at the top and the Edit menu always act on
   whichever tab is currently in front.
-- Dragging an image onto a tab that already has one open loads it into a
-  **new** tab instead of replacing what's there; dropping it onto an empty
-  tab loads it right there.
+- Drag either an image **or a `.imt` project file** onto a tab to open it --
+  same rule either way: onto a tab that already has something open, it
+  loads into a **new** tab; onto an empty tab, it loads right there.
 
 ## Where things are saved
 
@@ -65,7 +65,10 @@ There are two separate kinds of file, for two separate purposes:
   macOS; `~/.config/ImageMeasureTool/session.json` on Linux) rather than
   next to the script, so it stays local to each computer instead of getting
   synced by OneDrive/Git, and each machine keeps its own "last state"
-  independently.
+  independently. If a tab's image file is missing when the session is
+  restored (moved, renamed, deleted) but that tab was ever saved as a
+  project, the session falls back to the image embedded in that `.imt`
+  file automatically, the same way opening the project directly would.
 
 Closing a tab with the ✕ removes it right away, even from the session --
 only tabs still open when the app quits get carried forward automatically.
@@ -74,7 +77,7 @@ If you want a project to survive on its own regardless, use Save Project.
 ## How it works
 
 - **File > Open Image** loads a photo, or just drag an image file onto a
-  tab (needs `tkinterdnd2` -- see Setup). A photo from a phone or camera
+  tab. A photo from a phone or camera
   that comes in sideways is automatically rotated to match how Windows/Photos
   displays it (both read the same EXIF orientation tag in the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
