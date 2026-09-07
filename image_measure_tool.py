@@ -3,7 +3,8 @@
 Image Measure Tool
 ===================
 
-A Tkinter desktop app for measuring things in a photo.
+A Tkinter desktop app for measuring things in a photo, organized into tabs
+so you can have several photos/projects open at once.
 
 - Draw lines in three colors that map to real-world axes:
     Red   = X
@@ -18,10 +19,17 @@ A Tkinter desktop app for measuring things in a photo.
 - Draw a line that is forced parallel to an existing line (lock the
   direction, drag only changes position/length) -- handy for measuring
   parallel edges (e.g. opposite sides of a box) from a single photo.
-- Save/load your work as a .json project file next to the image, and
-  export all measurements to CSV.
+- Each open photo lives in its own tab (with a close button), so you can
+  work on several images/projects side by side.
+- Save/load a project as a single .imt file next to the image (or anywhere
+  you like) -- it carries the image path AND a copy of the image itself, so
+  it still opens correctly even if the photo gets moved, renamed, or is on
+  a different computer. Export all measurements to CSV separately.
+  Separately from project files, the whole window -- every open tab, even
+  ones you never explicitly saved -- is remembered automatically and
+  restored the next time you launch the app (see SESSION_PATH below).
 - Scroll to zoom in on your cursor, hold the middle mouse button to pan,
-  and drag an image file onto the window to open it.
+  and drag an image file onto a tab to open it.
 
 Requires: Python 3.8+, Pillow (pip install pillow). Tkinter ships with
 the standard Windows/macOS Python installers; on Linux install your
@@ -33,9 +41,12 @@ Run:
     python image_measure_tool.py
 """
 
+import base64
+import io
 import json
 import math
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -52,6 +63,7 @@ try:
 except ImportError:
     DND_AVAILABLE = False
 
+APP_NAME = "Image Measure Tool"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 AXIS_COLORS = {
@@ -63,7 +75,38 @@ DEFAULT_COLOR = "red"
 HANDLE_RADIUS = 5
 HIT_TOLERANCE = 6  # pixels, in canvas/screen space
 CLICK_MOVE_THRESHOLD = 4  # canvas pixels of movement that turns a click into a drag
-PROJECT_EXT = ".imt.json"
+PROJECT_EXT = ".imt"
+# .imt.json was this app's project extension before projects started embedding
+# a copy of the image -- still openable, just no longer the default Save name.
+LEGACY_PROJECT_EXT = ".imt.json"
+
+# --------------------------------------------------------------- session ---
+# Per-project files (.imt, saved with File > Save Project) are the portable,
+# explicit save format -- one file per project, carrying a copy of the image
+# itself (not just its path) so the project still opens correctly even if
+# the photo gets moved/renamed/shared to another computer.
+#
+# SESSION_PATH is a *separate*, small file the app writes on its own every
+# time it closes: which tabs were open, which image/lines each one had (even
+# if you never hit "Save Project"), and where you were zoomed/panned to. On
+# the next launch it's read back automatically to restore the window to
+# exactly how you left it. It intentionally lives in a per-user app-data
+# folder rather than next to the script, so it does NOT get swept up by
+# OneDrive/Git and each computer keeps its own "last state" independently.
+
+
+def _session_dir():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ImageMeasureTool")
+
+
+SESSION_PATH = os.path.join(_session_dir(), "session.json")
+SESSION_AUTOSAVE_MS = 60_000  # also save periodically, in case of a crash
 
 
 def dist(p, q):
@@ -74,6 +117,26 @@ def fmt_len(value, unit, decimals=3):
     if value is None:
         return "?"
     return f"{value:.{decimals}g} {unit}"
+
+
+def _make_x_icon(color, size=9, thickness=1, pad_left=5):
+    """A small transparent PhotoImage with an 'X' drawn in it, used for the
+    close button on each tab. Built by hand (no external icon file) so the
+    close button never depends on a bundled asset. The ttk layout engine
+    doesn't reliably honor a -padx on a custom image element (nested
+    -children layouts reject it), so the gap between the tab label and the
+    X is baked into the image itself via pad_left instead."""
+    width = size + pad_left
+    img = tk.PhotoImage(width=width, height=size)
+    img.blank()  # fully transparent
+    last = size - 1
+    for i in range(size):
+        for off in range(-thickness, thickness + 1):
+            j = i + off
+            if 0 <= j < size:
+                img.put(color, (i + pad_left, j))
+                img.put(color, (i + pad_left, last - j))
+    return img
 
 
 class Line:
@@ -121,121 +184,153 @@ class Line:
         return ln
 
 
-class ImageMeasureApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Image Measure Tool")
-        self.root.geometry("1200x780")
+# ---------------------------------------------------------------- tabs -----
+class ClosableNotebook(ttk.Notebook):
+    """A ttk.Notebook whose tabs each draw a small 'x' close button.
+
+    Clicking the x fires the virtual event <<NotebookTabClosed>>; the index
+    of the tab that was clicked is left on self.last_closed_index. This
+    class only detects the click -- it never removes a tab itself, so the
+    owner (App) can decide whether to confirm first (e.g. unsaved work).
+
+    If anything about the underlying ttk theme keeps the custom close
+    element from being created, we fall back to plain tabs and let the
+    owner's other close affordances (menu item, Ctrl+W, middle-click) cover
+    it -- see App._build_menu / ProjectTab bindings.
+    """
+
+    _style_name = "Closable.TNotebook"
+    _style_ready = False
+    _has_close_element = False
+
+    def __init__(self, master, **kwargs):
+        self._ensure_style()
+        if self._has_close_element:
+            kwargs["style"] = self._style_name
+        super().__init__(master, **kwargs)
+        self._pressed_index = None
+        self.last_closed_index = None
+        if self._has_close_element:
+            self.bind("<ButtonPress-1>", self._on_press, add=True)
+            self.bind("<ButtonRelease-1>", self._on_release, add=True)
+        # Fallback / extra convenience that works regardless of theme support:
+        # middle-click (or right-click) a tab to close it.
+        self.bind("<ButtonPress-2>", self._on_middle_click, add=True)
+
+    def _on_middle_click(self, event):
+        try:
+            index = self.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        self.last_closed_index = index
+        self.event_generate("<<NotebookTabClosed>>")
+
+    def _on_press(self, event):
+        element = self.identify(event.x, event.y)
+        if "close" in element:
+            index = self.index(f"@{event.x},{event.y}")
+            self.state(["pressed"])
+            self._pressed_index = index
+            return "break"
+
+    def _on_release(self, event):
+        if not self.instate(["pressed"]):
+            return
+        self.state(["!pressed"])
+        element = self.identify(event.x, event.y)
+        index = self._pressed_index
+        self._pressed_index = None
+        if "close" not in element or index is None:
+            return
+        if self.index(f"@{event.x},{event.y}") == index:
+            self.last_closed_index = index
+            self.event_generate("<<NotebookTabClosed>>")
+
+    @classmethod
+    def _ensure_style(cls):
+        if cls._style_ready:
+            return
+        cls._style_ready = True
+        try:
+            style = ttk.Style()
+            cls._close_images = (
+                _make_x_icon("#8a8a8a"),   # normal
+                _make_x_icon("#e53935"),   # hovered
+                _make_x_icon("#8a1c1c"),   # pressed
+            )
+            style.element_create(
+                "close", "image", cls._close_images[0],
+                ("pressed", "!disabled", cls._close_images[2]),
+                ("active", "!disabled", cls._close_images[1]),
+                border=6, sticky="")
+            style.layout(cls._style_name, [("Notebook.client", {"sticky": "nswe"})])
+            style.layout(cls._style_name + ".Tab", [
+                ("Notebook.tab", {"sticky": "nswe", "children": [
+                    ("Notebook.padding", {"sticky": "nswe", "children": [
+                        ("Notebook.focus", {"sticky": "nswe", "children": [
+                            ("Notebook.label", {"side": "left", "sticky": ""}),
+                            ("close", {"side": "left", "sticky": ""}),
+                        ]}),
+                    ]}),
+                ]}),
+            ])
+            cls._has_close_element = True
+        except tk.TclError:
+            cls._has_close_element = False
+
+
+class ProjectTab(ttk.Frame):
+    """One open project: an image, its measured lines, and its own view
+    (zoom/pan), tree list and known-length panel. A tab with no image
+    loaded yet is 'blank' -- opening an image or a project file re-uses a
+    blank tab instead of piling up empty ones.
+
+    Interaction preferences that aren't project data -- the active
+    draw color and draw/select mode -- are shared across tabs and live on
+    the App instance instead (self.app.current_color / self.app.mode).
+    """
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
 
         self.image_path = None
+        self.project_path = None
         self.pil_image = None            # original, full-res PIL image
         self.pyramid = []                 # [(factor, PIL.Image), ...], full-res first
         self.tk_image = None              # scaled PhotoImage currently shown
         self.scale = 1.0                  # canvas px per image px
         self.view_x = 0.0                 # image-space coords shown at canvas (0, 0)
         self.view_y = 0.0
+        self.rotation_turns = 0           # manual 90 deg-clockwise turns applied (0-3)
+        self.image_bytes_cache = None     # raw bytes of the loaded image file, for embedding
+                                            # a copy of it into the next Save Project
+        self.dirty = False                # unsaved changes since last Save Project / load
+
         self.pan_start = None             # (canvas_x, canvas_y, view_x, view_y) mid-drag
         self.lines = []                   # list[Line]
         self.selected_line_ids = []       # for compare / delete / calibrate
-        self.current_color = tk.StringVar(value=DEFAULT_COLOR)
-        self.mode = tk.StringVar(value="draw")   # 'draw' | 'select'
         self.drag_start_img = None        # (ix, iy) anchor for a hold-and-drag line
         self.drag_temp_id = None          # canvas id of the dashed preview line
         self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
         self.press_canvas = None          # (x, y) where the current press started
         self.press_moved = False          # did the mouse move past the click threshold?
         self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
-        self.project_path = None
 
-        self._build_menu()
-        self._build_toolbar()
         self._build_body()
-        self._build_statusbar()
-
-        self.root.bind("<Delete>", lambda e: self.delete_selected())
-        self.root.bind("<BackSpace>", lambda e: self.delete_selected())
-        self.root.bind("<space>", lambda e: self.cycle_color(1))
-        self.root.bind("<Escape>", self.cancel_click_draw)
 
     # ---------------------------------------------------------- UI setup
-    def _build_menu(self):
-        menubar = tk.Menu(self.root)
-        filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Open Image...", command=self.open_image, accelerator="Ctrl+O")
-        filemenu.add_separator()
-        filemenu.add_command(label="Open Project...", command=self.open_project)
-        filemenu.add_command(label="Save Project", command=self.save_project, accelerator="Ctrl+S")
-        filemenu.add_command(label="Save Project As...", command=self.save_project_as)
-        filemenu.add_separator()
-        filemenu.add_command(label="Export Measurements (CSV)...", command=self.export_csv)
-        filemenu.add_separator()
-        filemenu.add_command(label="Quit", command=self.root.quit)
-        menubar.add_cascade(label="File", menu=filemenu)
-
-        editmenu = tk.Menu(menubar, tearoff=0)
-        editmenu.add_command(label="Delete Selected Line(s)", command=self.delete_selected)
-        editmenu.add_command(label="Edit Known Length", command=self.focus_known_length)
-        editmenu.add_command(label="Compare Selected Two Lines...", command=self.compare_selected)
-        editmenu.add_separator()
-        editmenu.add_command(label="Rotate Image 90°", command=self.rotate_image)
-        menubar.add_cascade(label="Edit", menu=editmenu)
-
-        helpmenu = tk.Menu(menubar, tearoff=0)
-        helpmenu.add_command(label="How to use", command=self.show_help)
-        menubar.add_cascade(label="Help", menu=helpmenu)
-
-        self.root.config(menu=menubar)
-        self.root.bind("<Control-o>", lambda e: self.open_image())
-        self.root.bind("<Control-s>", lambda e: self.save_project())
-
-    def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=6)
-        bar.pack(side="top", fill="x")
-
-        ttk.Label(bar, text="Line color / axis:").pack(side="left", padx=(0, 4))
-        for color, meta in AXIS_COLORS.items():
-            b = tk.Radiobutton(
-                bar, text=f"{meta['axis']} ({color})", variable=self.current_color,
-                value=color, indicatoron=False, width=10,
-                fg="white", bg=meta["hex"], selectcolor=meta["hex"],
-                activebackground=meta["select_hex"])
-            b.pack(side="left", padx=2)
-
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        ttk.Label(bar, text="Mode:").pack(side="left", padx=(0, 4))
-        ttk.Radiobutton(bar, text="Draw line", variable=self.mode, value="draw",
-                         command=self._on_mode_change).pack(side="left")
-        ttk.Radiobutton(bar, text="Select", variable=self.mode, value="select",
-                         command=self._on_mode_change).pack(side="left")
-
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Compare 2 Lines", command=self.compare_selected).pack(side="left", padx=2)
-        ttk.Button(bar, text="Delete", command=self.delete_selected).pack(side="left", padx=2)
-
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Zoom In", command=lambda: self.zoom(1.25)).pack(side="left", padx=2)
-        ttk.Button(bar, text="Zoom Out", command=lambda: self.zoom(0.8)).pack(side="left", padx=2)
-        ttk.Button(bar, text="Fit", command=self.fit_to_window).pack(side="left", padx=2)
-        ttk.Button(bar, text="Rotate 90°", command=self.rotate_image).pack(side="left", padx=2)
-
-        self.parallel_hint = ttk.Label(bar, text="", foreground="#a05a00")
-        self.parallel_hint.pack(side="left", padx=10)
-
     def _build_body(self):
-        body = ttk.Frame(self.root)
-        body.pack(side="top", fill="both", expand=True)
-
         # side panel: known-length field + line list (on the LEFT)
-        side = ttk.Frame(body, padding=6, width=340)
+        side = ttk.Frame(self, padding=6, width=300)
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
 
-        # canvas (fills the rest of the window, to the right). No scrollbars --
-        # panning is done by dragging with the middle mouse button, and only
-        # the visible region is ever rendered (see _render_image), which is
+        # canvas (fills the rest of the tab). No scrollbars -- panning is
+        # done by dragging with the middle mouse button, and only the
+        # visible region is ever rendered (see _render_image), which is
         # what keeps zooming in on a big photo from lagging.
-        canvas_frame = ttk.Frame(body)
+        canvas_frame = ttk.Frame(self)
         canvas_frame.pack(side="left", fill="both", expand=True)
 
         self.canvas = tk.Canvas(canvas_frame, bg="#2b2b2b", cursor="crosshair",
@@ -294,7 +389,7 @@ class ImageMeasureApp:
 
         ttk.Label(known_frame, text="Type a value and press Enter. Leave blank for "
                                      "no known length -- nothing is required.",
-                  foreground="#666", wraplength=300, justify="left").pack(
+                  foreground="#666", wraplength=270, justify="left").pack(
             anchor="w", pady=(4, 0))
 
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
@@ -302,8 +397,8 @@ class ImageMeasureApp:
         self.tree = ttk.Treeview(side, columns=columns, show="headings", height=20,
                                   selectmode="extended")
         for col, label, width in [
-            ("color", "Color", 55), ("axis", "Axis", 40), ("px", "Pixels", 65),
-            ("real", "Real length", 100), ("calib", "Known?", 55),
+            ("color", "Color", 50), ("axis", "Axis", 36), ("px", "Pixels", 58),
+            ("real", "Real length", 90), ("calib", "Known?", 50),
         ]:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, anchor="center")
@@ -319,96 +414,30 @@ class ImageMeasureApp:
             lbl.pack(anchor="w")
             self.axis_labels[color] = lbl
 
-        help_text = (
-            "How to measure:\n"
-            "1. Pick a color (X/Y/Z) above, or press the Space\n"
-            "   bar to cycle it -- unless the known-length\n"
-            "   field has focus, where typing wins instead.\n"
-            "2. Draw a line either by holding the mouse button\n"
-            "   and dragging, releasing to finish it -- or with\n"
-            "   a quick click to start it, moving the mouse to\n"
-            "   aim it, and a second click to finish (Esc\n"
-            "   cancels a line started this way). Either way\n"
-            "   it's selected automatically and the known-\n"
-            "   length field above is focused, ready to type.\n"
-            "3. Type its real-world length and press Enter\n"
-            "   (or leave it blank -- nothing is required).\n"
-            "4. Every other line of that color then shows\n"
-            "   a computed length automatically.\n\n"
-            "Parallel: hold Shift while dragging a new line to\n"
-            "lock its direction to the selected line (or the\n"
-            "last line drawn, if none is selected) -- shown\n"
-            "below the toolbar buttons.\n\n"
-            "Editing: hovering over an endpoint of a line in\n"
-            "the CURRENT color shows a move cursor -- drag it\n"
-            "to reposition that point. Hovering over an\n"
-            "endpoint of a DIFFERENT color snaps a new line's\n"
-            "start to that exact point instead, so segments\n"
-            "in different axes can share a corner.\n\n"
-            "Compare: select exactly two lines in the list\n"
-            "(Ctrl/Shift-click) and click 'Compare 2 Lines'.\n\n"
-            "Rotate 90° (toolbar) rotates the photo a quarter\n"
-            "turn and keeps every existing line attached to\n"
-            "the same spot on the image.\n\n"
-            "Drag an image file onto the canvas to open it"
-            + ("." if self.dnd_active else " (run: pip install tkinterdnd2).") + "\n"
-            "Scroll wheel zooms in on your cursor. Hold the\n"
-            "middle mouse button and drag to pan."
-        )
-        ttk.Label(side, text=help_text, foreground="#555", justify="left").pack(
-            anchor="w", pady=(10, 0))
+        self.placeholder_label = ttk.Label(
+            self.canvas, text="Open an image, or drag one onto this tab"
+            + ("." if self.dnd_active else " (drag-and-drop needs: pip install tkinterdnd2)."),
+            foreground="#aaaaaa", background="#2b2b2b")
 
-    def _build_statusbar(self):
-        msg = "Open an image to begin (File > Open Image"
-        msg += " or drag one onto the canvas)." if self.dnd_active else ")."
-        self.status = tk.StringVar(value=msg)
-        bar = ttk.Label(self.root, textvariable=self.status, anchor="w",
-                         relief="sunken", padding=(6, 2))
-        bar.pack(side="bottom", fill="x")
+    def is_blank(self):
+        return self.pil_image is None
 
-    def _on_mode_change(self):
-        self.dragging_vertex = None
-        self.drag_start_img = None
-        self.cancel_click_draw()
-        self.canvas.config(cursor="crosshair" if self.mode.get() == "draw" else "hand2")
-        self._update_parallel_hint()
+    def display_name(self):
+        return os.path.basename(self.image_path) if self.image_path else "Untitled"
 
-    def cancel_click_draw(self, event=None):
-        """Escape, or switching modes: abandon a line that was started with
-        a short click and is waiting for the closing click."""
-        if self.click_draw_start is None:
-            return
-        self.click_draw_start = None
-        if self.drag_temp_id:
-            self.canvas.delete(self.drag_temp_id)
-            self.drag_temp_id = None
-        self.status.set("Line cancelled.")
+    def mark_dirty(self):
+        if not self.dirty:
+            self.dirty = True
+            self.app.update_tab_title(self)
 
-    def cycle_color(self, direction=1):
-        """Space bar switches the active line color (X -> Y -> Z -> X), so
-        you don't have to reach for the mouse mid-measurement. Left alone
-        while the known-length field (or its unit box) has focus -- typing
-        a length takes priority, and a space is meaningless in a number
-        anyway (see the entry's own <KeyPress-space> binding, which blocks
-        it from being typed at all)."""
-        focused = self.root.focus_get()
-        if focused in (self.known_length_entry, self.known_unit_box):
-            return None
-        colors = list(AXIS_COLORS.keys())
-        idx = colors.index(self.current_color.get())
-        self.current_color.set(colors[(idx + direction) % len(colors)])
-        return "break"
+    def _clear_placeholder(self):
+        self.placeholder_label.place_forget()
+
+    def _show_placeholder(self):
+        self.canvas.delete("all")
+        self.placeholder_label.place(relx=0.5, rely=0.5, anchor="center")
 
     # ------------------------------------------------------------- image
-    def open_image(self):
-        path = filedialog.askopenfilename(
-            title="Open image",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
-                       ("All files", "*.*")])
-        if not path:
-            return
-        self._load_image_path(path)
-
     def on_drop_file(self, event):
         # event.data may be one path, or several space-separated and
         # brace-quoted (e.g. "{C:/a b/img.jpg} {C:/other.png}") -- splitlist
@@ -416,28 +445,41 @@ class ImageMeasureApp:
         paths = self.canvas.tk.splitlist(event.data)
         for path in paths:
             if path.lower().endswith(IMAGE_EXTS):
-                self._load_image_path(path)
+                self.app.handle_dropped_file(self, path)
                 return
         messagebox.showinfo("Not an image", "Drop an image file (jpg/png/bmp/tif/webp).")
 
-    def _load_image_path(self, path):
-        try:
-            img = Image.open(path)
-            # Cameras/phones store landscape pixel data plus an EXIF
-            # "Orientation" tag saying how to rotate/flip it for display.
-            # Windows (and every normal photo viewer) reads that tag; PIL's
-            # raw pixels don't, which is why an image can come in sideways
-            # here even though Explorer shows it upright. This applies the
-            # same correction Windows does, then discards the tag so it
-            # isn't applied twice.
-            img = ImageOps.exif_transpose(img)
-            img.load()
-        except Exception as exc:
-            messagebox.showerror("Could not open image", str(exc))
-            return
-        self.image_path = path
-        self.pil_image = img.convert("RGB")
+    def _apply_loaded_bytes(self, raw_bytes, rotation_turns=0):
+        """Build self.pil_image (+ pyramid) from raw image FILE bytes --
+        i.e. exactly what's on disk, not decoded pixels -- applying EXIF
+        auto-rotation and any additional manual rotation_turns on top.
+        Shared by loading a real file from disk and loading the copy
+        embedded in a .imt project file, so both behave identically and
+        both leave self.image_bytes_cache set for the next Save Project to
+        re-embed (unchanged, so re-saving never re-compresses the photo)."""
+        img = Image.open(io.BytesIO(raw_bytes))
+        # Cameras/phones store landscape pixel data plus an EXIF
+        # "Orientation" tag saying how to rotate/flip it for display.
+        # Windows (and every normal photo viewer) reads that tag; PIL's
+        # raw pixels don't, which is why an image can come in sideways
+        # here even though Explorer shows it upright. This applies the
+        # same correction Windows does, then discards the tag so it
+        # isn't applied twice.
+        img = ImageOps.exif_transpose(img)
+        img.load()
+        img = img.convert("RGB")
+        for _ in range(rotation_turns % 4):
+            img = img.transpose(Image.ROTATE_270)  # matches rotate_image()'s direction
+        self.pil_image = img
+        self.rotation_turns = rotation_turns % 4
+        self.image_bytes_cache = raw_bytes
         self._build_pyramid()
+
+    def _reset_after_image_load(self, display_path):
+        """Common bookkeeping after ANY fresh image load (from a path or
+        from an embedded copy) -- new image, so any previous lines/project
+        association no longer apply."""
+        self.image_path = display_path
         self.dragging_vertex = None
         self.drag_start_img = None
         self.drag_temp_id = None
@@ -445,11 +487,43 @@ class ImageMeasureApp:
         self.lines = []
         self.selected_line_ids = []
         self.project_path = None
-        self.root.title(f"Image Measure Tool - {os.path.basename(path)}")
-        self.fit_to_window()
-        self.redraw()
-        self.status.set(f"Loaded {os.path.basename(path)} "
-                         f"({self.pil_image.width}x{self.pil_image.height}px)")
+        self.dirty = False
+        self._clear_placeholder()
+        self.app.update_tab_title(self)
+
+    def load_image_path(self, path, rotation_turns=0, silent=False):
+        """Load a fresh image straight from disk (no project data) into
+        this tab. Returns True on success. silent=True skips dialogs/
+        status/redraw -- used while restoring a saved session or loading a
+        project, where the caller applies its own lines/view afterward."""
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            self._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror("Could not open image", str(exc))
+            return False
+        self._reset_after_image_load(path)
+        if not silent:
+            self.fit_to_window()
+            self.redraw()
+            self.app.set_status(f"Loaded {os.path.basename(path)} "
+                                 f"({self.pil_image.width}x{self.pil_image.height}px)")
+        return True
+
+    def load_embedded_image(self, raw_bytes, display_path, rotation_turns=0):
+        """Load an image from bytes embedded in a .imt project file (used
+        when the original file can no longer be found at its saved path).
+        Always 'silent' in the load_image_path sense -- the caller
+        (load_project_data) does its own fit/redraw/status afterward."""
+        try:
+            self._apply_loaded_bytes(raw_bytes, rotation_turns=rotation_turns)
+        except Exception as exc:
+            messagebox.showerror("Could not read the image embedded in this project", str(exc))
+            return False
+        self._reset_after_image_load(display_path)
+        return True
 
     def fit_to_window(self):
         if not self.pil_image:
@@ -516,13 +590,15 @@ class ImageMeasureApp:
         self.cancel_click_draw()
         old_h = self.pil_image.height
         self.pil_image = self.pil_image.transpose(Image.ROTATE_270)  # 90 deg clockwise
+        self.rotation_turns = (self.rotation_turns + 1) % 4
         self._build_pyramid()
         for ln in self.lines:
             ln.x1, ln.y1 = old_h - ln.y1, ln.x1
             ln.x2, ln.y2 = old_h - ln.y2, ln.x2
         self.fit_to_window()
         self.redraw()
-        self.status.set("Rotated image 90 degrees.")
+        self.mark_dirty()
+        self.app.set_status("Rotated image 90 degrees.")
 
     def _build_pyramid(self):
         """Precompute progressively half-sized versions of the loaded image.
@@ -557,6 +633,8 @@ class ImageMeasureApp:
         this never resizes more source pixels than the canvas itself has
         room for -- that's what keeps zooming smooth regardless of the
         original photo's resolution."""
+        if not self.pil_image:
+            return
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
         iw, ih = self.pil_image.width, self.pil_image.height
@@ -660,14 +738,6 @@ class ImageMeasureApp:
                 return ln
         return self.lines[-1] if self.lines else None
 
-    def _update_parallel_hint(self):
-        ref = self._parallel_reference()
-        if ref:
-            self.parallel_hint.config(
-                text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
-        else:
-            self.parallel_hint.config(text="")
-
     def _constrain_to_reference(self, ix1, iy1, ix2, iy2, ref):
         """Project (ix2, iy2) onto the line through (ix1, iy1) running in
         ref's direction, so the new segment is parallel to ref."""
@@ -693,7 +763,7 @@ class ImageMeasureApp:
         ix, iy = self.canvas_event_to_img(event)
         tol_img = HIT_TOLERANCE / self.scale
 
-        if self.mode.get() == "select":
+        if self.app.mode.get() == "select":
             ln = self.find_line_near(ix, iy, tol_img)
             if ln:
                 self.select_line(ln.id, additive=bool(event.state & 0x0001))  # shift
@@ -710,7 +780,7 @@ class ImageMeasureApp:
         hit = self.find_vertex_near(ix, iy, tol_img)
         if hit:
             vline, vidx = hit
-            if vline.color == self.current_color.get():
+            if vline.color == self.app.current_color.get():
                 self.dragging_vertex = (vline, vidx)
                 self.drag_start_img = None
                 self.select_line(vline.id)
@@ -744,7 +814,7 @@ class ImageMeasureApp:
             self.redraw()
             return
 
-        if self.drag_start_img is None or self.mode.get() != "draw":
+        if self.drag_start_img is None or self.app.mode.get() != "draw":
             return
 
         # Once the mouse has moved far enough, this press-and-hold counts as
@@ -770,7 +840,7 @@ class ImageMeasureApp:
                 ex, ey = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 cx, cy = self.img_to_canvas(ex, ey)
 
-        color_hex = AXIS_COLORS[self.current_color.get()]["hex"]
+        color_hex = AXIS_COLORS[self.app.current_color.get()]["hex"]
         if self.drag_temp_id:
             self.canvas.coords(self.drag_temp_id, sx, sy, cx, cy)
         else:
@@ -782,7 +852,7 @@ class ImageMeasureApp:
         what drives its live preview towards the cursor. Otherwise it just
         updates the cursor to hint what a click here would do (move a
         vertex vs. snap-start a new line vs. plain draw)."""
-        if not self.pil_image or self.mode.get() != "draw":
+        if not self.pil_image or self.app.mode.get() != "draw":
             return
 
         if self.click_draw_start is not None:
@@ -792,7 +862,7 @@ class ImageMeasureApp:
         ix, iy = self.canvas_to_img(event.x, event.y)
         tol_img = HIT_TOLERANCE / self.scale
         hit = self.find_vertex_near(ix, iy, tol_img)
-        if hit and hit[0].color == self.current_color.get():
+        if hit and hit[0].color == self.app.current_color.get():
             self.canvas.config(cursor="fleur")
         elif hit:
             self.canvas.config(cursor="hand2")
@@ -807,10 +877,11 @@ class ImageMeasureApp:
             ln, idx = self.dragging_vertex
             self.dragging_vertex = None
             self.redraw()
-            self.status.set(f"Moved line #{ln.id}'s endpoint.")
+            self.mark_dirty()
+            self.app.set_status(f"Moved line #{ln.id}'s endpoint.")
             return
 
-        if self.drag_start_img is None or self.mode.get() != "draw":
+        if self.drag_start_img is None or self.app.mode.get() != "draw":
             self.drag_start_img = None
             return
 
@@ -824,8 +895,8 @@ class ImageMeasureApp:
             # the cursor via on_canvas_hover until the closing click, or
             # Escape cancels it.
             self.click_draw_start = (ix1, iy1)
-            self.status.set("Line started -- click again to finish it, "
-                             "or press Esc to cancel.")
+            self.app.set_status("Line started -- click again to finish it, "
+                                 "or press Esc to cancel.")
             return
 
         ix2, iy2 = self.canvas_to_img(event.x, event.y)
@@ -846,14 +917,15 @@ class ImageMeasureApp:
                 parallel_to = ref.id
 
         if dist((ix1, iy1), (ix2, iy2)) < 3 / self.scale:
-            self.status.set("Line too short -- not created.")
+            self.app.set_status("Line too short -- not created.")
             return
 
-        color = self.current_color.get()
+        color = self.app.current_color.get()
         line = Line(color, ix1, iy1, ix2, iy2, unit=self._last_unit_used(),
                     parallel_to=parallel_to)
         self.lines.append(line)
         self.select_line(line.id)   # also redraws and populates the known-length field
+        self.mark_dirty()
 
         # Ready for the user to immediately type the known length -- no popup,
         # nothing required. Just focus the field with the cursor in place.
@@ -872,14 +944,53 @@ class ImageMeasureApp:
                 return ln
         return None
 
+    # ------------------------------------------------------------- mode
+    def on_mode_changed(self):
+        """Called for the active tab whenever the shared draw/select mode
+        changes, and again right after this tab becomes active (in case the
+        mode changed while it was in the background)."""
+        self.dragging_vertex = None
+        self.drag_start_img = None
+        self.cancel_click_draw()
+        self.canvas.config(cursor="crosshair" if self.app.mode.get() == "draw" else "hand2")
+
+    def cancel_click_draw(self, event=None):
+        """Escape, or switching modes: abandon a line that was started with
+        a short click and is waiting for the closing click."""
+        if self.click_draw_start is None:
+            return
+        self.click_draw_start = None
+        if self.drag_temp_id:
+            self.canvas.delete(self.drag_temp_id)
+            self.drag_temp_id = None
+        self.app.set_status("Line cancelled.")
+
+    def cycle_color(self, direction=1):
+        """Space bar switches the active line color (X -> Y -> Z -> X), so
+        you don't have to reach for the mouse mid-measurement. Left alone
+        while the known-length field (or its unit box) has focus -- typing
+        a length takes priority, and a space is meaningless in a number
+        anyway (see the entry's own <KeyPress-space> binding, which blocks
+        it from being typed at all)."""
+        focused = self.app.root.focus_get()
+        if focused in (self.known_length_entry, self.known_unit_box):
+            return None
+        colors = list(AXIS_COLORS.keys())
+        idx = colors.index(self.app.current_color.get())
+        self.app.current_color.set(colors[(idx + direction) % len(colors)])
+        return "break"
+
     # -------------------------------------------------------------- redraw
     def redraw(self):
+        if not self.pil_image:
+            self._show_placeholder()
+            return
         self.canvas.delete("line", "label", "handle")
         for ln in self.lines:
             self._draw_line(ln)
         self._update_tree()
         self._update_axis_labels()
-        self._update_parallel_hint()
+        self.app.refresh_toolbar_hint(self)
 
     def _draw_line(self, ln):
         x1, y1 = self.img_to_canvas(ln.x1, ln.y1)
@@ -994,18 +1105,22 @@ class ImageMeasureApp:
             return
         text = self.known_length_var.get().strip()
         if text == "":
+            changed = ln.known_length is not None
             ln.known_length = None
         else:
             try:
                 value = float(text)
             except ValueError:
-                self.status.set("Known length must be a number (or leave it blank).")
+                self.app.set_status("Known length must be a number (or leave it blank).")
                 return
             if value <= 0:
-                self.status.set("Known length must be greater than 0.")
+                self.app.set_status("Known length must be greater than 0.")
                 return
+            changed = ln.known_length != value
             ln.known_length = value
         ln.unit = self.known_unit_var.get().strip() or "mm"
+        if changed:
+            self.mark_dirty()
         self.redraw()
         self.populate_known_length_field()
 
@@ -1051,6 +1166,7 @@ class ImageMeasureApp:
                                 f"#{b.id}'s known length?"):
             b.known_length = b_real
             b.unit = a_unit
+            self.mark_dirty()
             self.redraw()
 
     def delete_selected(self):
@@ -1058,6 +1174,7 @@ class ImageMeasureApp:
             return
         self.lines = [ln for ln in self.lines if ln.id not in self.selected_line_ids]
         self.selected_line_ids = []
+        self.mark_dirty()
         self.redraw()
 
     # ------------------------------------------------------------- project
@@ -1074,52 +1191,95 @@ class ImageMeasureApp:
         default = os.path.splitext(self.image_path)[0] + PROJECT_EXT
         path = filedialog.asksaveasfilename(
             title="Save project", initialfile=os.path.basename(default),
-            defaultextension=".json", filetypes=[("Image Measure project", "*.json")])
+            defaultextension=PROJECT_EXT,
+            filetypes=[("Image Measure project", f"*{PROJECT_EXT}")])
         if not path:
             return
         self.project_path = path
         self._write_project(path)
 
     def _write_project(self, path):
+        image_data_b64 = None
+        if self.image_bytes_cache:
+            image_data_b64 = base64.b64encode(self.image_bytes_cache).decode("ascii")
         data = {
             "image_path": self.image_path,
+            # A copy of the original image FILE (not just its pixels -- this
+            # preserves the exact bytes, so re-saving never re-compresses
+            # it), so this project still opens correctly even if the photo
+            # at image_path gets moved, renamed, or isn't on this computer.
+            "image_data": image_data_b64,
+            "rotation_turns": self.rotation_turns,
             "lines": [ln.to_dict() for ln in self.lines],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        self.status.set(f"Saved project to {path}")
+        self.dirty = False
+        self.app.update_tab_title(self)
+        size_note = ""
+        if image_data_b64:
+            size_kb = (len(image_data_b64) * 3 // 4) // 1024
+            size_note = f" ({size_kb:,} KB -- image embedded)"
+        self.app.set_status(f"Saved project to {path}{size_note}")
 
-    def open_project(self):
-        path = filedialog.askopenfilename(
-            title="Open project", filetypes=[("Image Measure project", "*.json")])
-        if not path:
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    def load_project_data(self, path):
+        """Load a .imt project (image path + an embedded copy of the image
+        + lines) into this tab. Returns True on success, False if
+        cancelled/failed. Prefers the live file at the saved image_path
+        when it's still there; falls back to the embedded copy (or, for an
+        older project saved before image embedding existed, asks the user
+        to locate the file) when it isn't."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Could not open project", str(exc))
+            return False
+
         img_path = data.get("image_path")
-        if not img_path or not os.path.exists(img_path):
-            img_path = filedialog.askopenfilename(
+        rotation_turns = data.get("rotation_turns", 0)
+        image_b64 = data.get("image_data")
+        loaded = False
+        status_note = ""
+
+        if img_path and os.path.exists(img_path):
+            loaded = self.load_image_path(img_path, rotation_turns=rotation_turns, silent=True)
+
+        if not loaded and image_b64:
+            try:
+                raw = base64.b64decode(image_b64)
+            except Exception as exc:
+                raw = None
+                messagebox.showwarning("Embedded image unreadable",
+                                        f"The image data embedded in this project "
+                                        f"couldn't be decoded: {exc}")
+            if raw:
+                loaded = self.load_embedded_image(raw, display_path=img_path,
+                                                   rotation_turns=rotation_turns)
+                if loaded:
+                    status_note = (" (original file not found at its saved location -- "
+                                    "opened the copy embedded in the project instead)")
+
+        if not loaded:
+            # Last resort: an older project saved before images were embedded,
+            # and the original file has also moved -- ask where it went.
+            located = filedialog.askopenfilename(
                 title="Original image not found -- locate it",
                 filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
-            if not img_path:
-                return
-        img = Image.open(img_path)
-        img = ImageOps.exif_transpose(img)  # match how _load_image_path opens it
-        img.load()
-        self.image_path = img_path
-        self.pil_image = img.convert("RGB")
-        self._build_pyramid()
-        self.dragging_vertex = None
-        self.drag_start_img = None
-        self.drag_temp_id = None
-        self.click_draw_start = None
+            if not located:
+                return False
+            if not self.load_image_path(located, rotation_turns=rotation_turns, silent=True):
+                return False
+
         self.lines = [Line.from_dict(d) for d in data.get("lines", [])]
         self.selected_line_ids = []
         self.project_path = path
-        self.root.title(f"Image Measure Tool - {os.path.basename(img_path)}")
+        self.dirty = False
+        self.app.update_tab_title(self)
         self.fit_to_window()
         self.redraw()
-        self.status.set(f"Loaded project {path}")
+        self.app.set_status(f"Loaded project {path}{status_note}")
+        return True
 
     def export_csv(self):
         if not self.lines:
@@ -1144,11 +1304,154 @@ class ImageMeasureApp:
                             ln.known_length if ln.known_length else "",
                             ln.unit or "", f"{real:.4f}" if real else "",
                             ln.parallel_to or ""])
-        self.status.set(f"Exported {len(self.lines)} lines to {path}")
+        self.app.set_status(f"Exported {len(self.lines)} lines to {path}")
+
+    # -------------------------------------------------------------- session
+    def snapshot(self):
+        """Everything needed to restore this tab exactly, even if it was
+        never explicitly saved as a project -- used for session autosave."""
+        return {
+            "image_path": self.image_path,
+            "project_path": self.project_path,
+            "rotation_turns": self.rotation_turns,
+            "scale": self.scale,
+            "view_x": self.view_x,
+            "view_y": self.view_y,
+            "lines": [ln.to_dict() for ln in self.lines],
+        }
+
+
+class App:
+    """Owns the window chrome shared by every tab: the menu, the toolbar
+    (draw color / mode / compare / delete / zoom / rotate), the status bar,
+    and the notebook of ProjectTabs. Also owns saving/restoring the session
+    file so the whole window comes back the way you left it."""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_NAME)
+        self.root.geometry("1300x820")
+
+        self.current_color = tk.StringVar(value=DEFAULT_COLOR)
+        self.mode = tk.StringVar(value="draw")
+        self.mode.trace_add("write", self._on_mode_var_change)
+
+        self._build_menu()
+        self._build_toolbar()
+
+        self.notebook = ClosableNotebook(self.root)
+        self.notebook.pack(side="top", fill="both", expand=True)
+        self.notebook.bind("<<NotebookTabClosed>>", self._on_notebook_tab_closed)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        self._build_statusbar()
+
+        self.root.bind("<Delete>", lambda e: self._dispatch("delete_selected"))
+        self.root.bind("<BackSpace>", lambda e: self._dispatch("delete_selected"))
+        self.root.bind("<space>", self._on_space_key)
+        self.root.bind("<Escape>", lambda e: self._dispatch("cancel_click_draw"))
+        self.root.bind("<Control-o>", lambda e: self.open_image())
+        self.root.bind("<Control-s>", lambda e: self._dispatch("save_project"))
+        self.root.bind("<Control-t>", lambda e: self.new_tab())
+        self.root.bind("<Control-w>", lambda e: self.close_active_tab())
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
+
+        if not self._restore_session():
+            self.new_tab()
+        self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
+
+    # ---------------------------------------------------------- UI setup
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+T")
+        filemenu.add_command(label="Open Image...", command=self.open_image, accelerator="Ctrl+O")
+        filemenu.add_separator()
+        filemenu.add_command(label="Open Project...", command=self.open_project)
+        filemenu.add_command(label="Save Project", command=lambda: self._dispatch("save_project"),
+                              accelerator="Ctrl+S")
+        filemenu.add_command(label="Save Project As...",
+                              command=lambda: self._dispatch("save_project_as"))
+        filemenu.add_separator()
+        filemenu.add_command(label="Close Tab", command=self.close_active_tab, accelerator="Ctrl+W")
+        filemenu.add_separator()
+        filemenu.add_command(label="Export Measurements (CSV)...",
+                              command=lambda: self._dispatch("export_csv"))
+        filemenu.add_separator()
+        filemenu.add_command(label="Quit", command=self.on_app_close)
+        menubar.add_cascade(label="File", menu=filemenu)
+
+        editmenu = tk.Menu(menubar, tearoff=0)
+        editmenu.add_command(label="Delete Selected Line(s)",
+                              command=lambda: self._dispatch("delete_selected"))
+        editmenu.add_command(label="Edit Known Length",
+                              command=lambda: self._dispatch("focus_known_length"))
+        editmenu.add_command(label="Compare Selected Two Lines...",
+                              command=lambda: self._dispatch("compare_selected"))
+        editmenu.add_separator()
+        editmenu.add_command(label="Rotate Image 90°", command=lambda: self._dispatch("rotate_image"))
+        menubar.add_cascade(label="Edit", menu=editmenu)
+
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="How to use", command=self.show_help)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+
+        self.root.config(menu=menubar)
+
+    def _build_toolbar(self):
+        bar = ttk.Frame(self.root, padding=6)
+        bar.pack(side="top", fill="x")
+
+        ttk.Label(bar, text="Line color / axis:").pack(side="left", padx=(0, 4))
+        for color, meta in AXIS_COLORS.items():
+            b = tk.Radiobutton(
+                bar, text=f"{meta['axis']} ({color})", variable=self.current_color,
+                value=color, indicatoron=False, width=10,
+                fg="white", bg=meta["hex"], selectcolor=meta["hex"],
+                activebackground=meta["select_hex"])
+            b.pack(side="left", padx=2)
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        ttk.Label(bar, text="Mode:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(bar, text="Draw line", variable=self.mode, value="draw").pack(side="left")
+        ttk.Radiobutton(bar, text="Select", variable=self.mode, value="select").pack(side="left")
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text="Compare 2 Lines",
+                   command=lambda: self._dispatch("compare_selected")).pack(side="left", padx=2)
+        ttk.Button(bar, text="Delete",
+                   command=lambda: self._dispatch("delete_selected")).pack(side="left", padx=2)
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text="Zoom In", command=lambda: self._dispatch("zoom", 1.25)).pack(side="left", padx=2)
+        ttk.Button(bar, text="Zoom Out", command=lambda: self._dispatch("zoom", 0.8)).pack(side="left", padx=2)
+        ttk.Button(bar, text="Fit", command=lambda: self._dispatch("fit_to_window")).pack(side="left", padx=2)
+        ttk.Button(bar, text="Rotate 90°", command=lambda: self._dispatch("rotate_image")).pack(side="left", padx=2)
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
+        ttk.Button(bar, text="Close Tab \u2715", command=self.close_active_tab).pack(side="left", padx=2)
+
+        self.parallel_hint = ttk.Label(bar, text="", foreground="#a05a00")
+        self.parallel_hint.pack(side="left", padx=10)
+
+    def _build_statusbar(self):
+        self.status_var = tk.StringVar(value="Open an image to begin (File > Open Image, "
+                                               "Ctrl+O, or drag one onto a tab).")
+        bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w",
+                         relief="sunken", padding=(6, 2))
+        bar.pack(side="bottom", fill="x")
+
+    def set_status(self, msg):
+        self.status_var.set(msg)
 
     def show_help(self):
         messagebox.showinfo("How to use", (
-            "1. File > Open Image to load a photo.\n"
+            "1. Each open photo lives in its own tab -- use New Tab (Ctrl+T) or "
+            "File > Open Image (Ctrl+O) to start another; the \u2715 on a tab (or "
+            "middle-click, or Ctrl+W) closes it.\n"
             "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line. "
             "It's selected automatically and the known-length field on the left "
             "is focused, ready for you to type into.\n"
@@ -1162,14 +1465,213 @@ class ImageMeasureApp:
             "5. 'Compare 2 Lines' lets you compare any two lines directly "
             "(they don't need to be the same color), even without calibrating "
             "a whole axis.\n"
-            "6. 'Draw parallel' mode: click near an existing line to lock its "
-            "direction, then drag anywhere to add a new line guaranteed parallel "
-            "to it.\n"
+            "6. Hold Shift while drawing a new line to lock its direction "
+            "parallel to the selected line (or the last line drawn).\n"
             "7. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "8. Save Project keeps the image path + all lines in a .json file "
-            "you can reopen later. Export CSV for a spreadsheet of measurements."
+            "8. Save Project keeps one tab's image (a full copy, not just its "
+            "path), rotation, and lines in a single .imt file you can reopen "
+            "later -- even if the photo has since moved or is on another "
+            "computer. Export CSV for a spreadsheet of measurements.\n"
+            "9. The whole window -- every open tab, saved or not -- is remembered "
+            "automatically and restored next time you launch the app."
         ))
+
+    # -------------------------------------------------------------- tabs
+    def active_tab(self):
+        sel = self.notebook.select()
+        if not sel:
+            return None
+        return self.notebook.nametowidget(sel)
+
+    def new_tab(self, focus=True):
+        tab = ProjectTab(self.notebook, self)
+        self.notebook.add(tab, text="Untitled")
+        if focus:
+            self.notebook.select(tab)
+        return tab
+
+    def close_active_tab(self):
+        self.request_close_tab(self.active_tab())
+
+    def request_close_tab(self, tab):
+        if tab is None:
+            return
+        if tab.dirty:
+            name = tab.display_name()
+            if not messagebox.askyesno(
+                    "Close tab",
+                    f'"{name}" has measurements that were never saved as a project '
+                    "file.\n\nClose it anyway? (Your other open tabs, and anything "
+                    "you don't close, are kept automatically and restored next time "
+                    "you open the app -- but a tab you close now is gone for good "
+                    "unless you've used Save Project on it.)"):
+                return
+        self.notebook.forget(tab)
+        tab.destroy()
+        if not self.notebook.tabs():
+            self.new_tab()
+
+    def _on_notebook_tab_closed(self, event=None):
+        idx = self.notebook.last_closed_index
+        if idx is None:
+            return
+        tabs = self.notebook.tabs()
+        if 0 <= idx < len(tabs):
+            self.request_close_tab(self.notebook.nametowidget(tabs[idx]))
+
+    def _on_tab_changed(self, event=None):
+        tab = self.active_tab()
+        if tab is None:
+            return
+        tab.on_mode_changed()
+        self.refresh_toolbar_hint(tab)
+        self.update_tab_title(tab)
+
+    def _on_mode_var_change(self, *args):
+        tab = self.active_tab()
+        if tab:
+            tab.on_mode_changed()
+
+    def _on_space_key(self, event):
+        tab = self.active_tab()
+        return tab.cycle_color(1) if tab else None
+
+    def _dispatch(self, method_name, *args):
+        tab = self.active_tab()
+        if tab is None:
+            return None
+        return getattr(tab, method_name)(*args)
+
+    def update_tab_title(self, tab):
+        try:
+            idx = self.notebook.index(tab)
+        except tk.TclError:
+            return
+        name = tab.display_name()
+        text = ("* " if tab.dirty else "") + name
+        self.notebook.tab(idx, text=text)
+        if tab is self.active_tab():
+            self.root.title(f"{APP_NAME} - {name}" if tab.image_path else APP_NAME)
+
+    def refresh_toolbar_hint(self, tab):
+        if tab is not self.active_tab():
+            return
+        ref = tab._parallel_reference()
+        if ref:
+            self.parallel_hint.config(
+                text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
+        else:
+            self.parallel_hint.config(text="")
+
+    # -------------------------------------------------------------- opening
+    def _open_into_tab(self, loader, prefer_tab=None):
+        """Reuse prefer_tab (or the active tab) if it's blank; otherwise
+        open into a fresh tab. loader(tab) -> bool success. Cleans up the
+        fresh tab again if loading was cancelled/failed."""
+        candidate = prefer_tab or self.active_tab()
+        reuse = candidate is not None and candidate.is_blank()
+        target = candidate if reuse else self.new_tab(focus=False)
+        ok = loader(target)
+        if ok:
+            self.notebook.select(target)
+        elif not reuse:
+            self.notebook.forget(target)
+            target.destroy()
+        return ok
+
+    def open_image(self):
+        path = filedialog.askopenfilename(
+            title="Open image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self._open_into_tab(lambda tab: tab.load_image_path(path))
+
+    def open_project(self):
+        path = filedialog.askopenfilename(
+            title="Open project",
+            filetypes=[("Image Measure project", f"*{PROJECT_EXT} *{LEGACY_PROJECT_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self._open_into_tab(lambda tab: tab.load_project_data(path))
+
+    def handle_dropped_file(self, source_tab, path):
+        self._open_into_tab(lambda tab: tab.load_image_path(path), prefer_tab=source_tab)
+
+    # -------------------------------------------------------------- session
+    def _all_tabs(self):
+        return [self.notebook.nametowidget(w) for w in self.notebook.tabs()]
+
+    def save_session(self):
+        """Best-effort: a problem here should never stop the app from
+        closing, and never corrupt a previous good session file (written
+        via a temp file + atomic replace)."""
+        try:
+            tabs = self._all_tabs()
+            tabs_data = [t.snapshot() for t in tabs]
+            active = self.notebook.index(self.notebook.select()) if tabs else 0
+            data = {"version": 1, "active_index": active, "tabs": tabs_data}
+            os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
+            tmp = SESSION_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, SESSION_PATH)
+        except Exception:
+            pass
+
+    def _restore_session(self):
+        if not os.path.exists(SESSION_PATH):
+            return False
+        try:
+            with open(SESSION_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+
+        restored_any = False
+        for entry in data.get("tabs", []):
+            tab = ProjectTab(self.notebook, self)
+            title = "Untitled"
+            img_path = entry.get("image_path")
+            if img_path and os.path.exists(img_path):
+                ok = tab.load_image_path(
+                    img_path, rotation_turns=entry.get("rotation_turns", 0), silent=True)
+                if ok:
+                    tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
+                    tab.project_path = entry.get("project_path")
+                    if entry.get("scale"):
+                        tab.scale = entry["scale"]
+                        tab.view_x = entry.get("view_x", tab.view_x)
+                        tab.view_y = entry.get("view_y", tab.view_y)
+                        tab._render_image()
+                    else:
+                        tab.fit_to_window()
+                    tab.dirty = False
+                    tab.redraw()
+                    title = tab.display_name()
+            elif img_path:
+                self.set_status(f"Previously open image no longer found, skipped: {img_path}")
+            self.notebook.add(tab, text=title)
+            restored_any = True
+
+        if restored_any:
+            idx = data.get("active_index", 0)
+            tabs = self.notebook.tabs()
+            if 0 <= idx < len(tabs):
+                self.notebook.select(tabs[idx])
+            self.set_status(f"Restored {len(tabs)} tab(s) from your last session.")
+        return restored_any
+
+    def _periodic_autosave(self):
+        self.save_session()
+        self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
+
+    def on_app_close(self):
+        self.save_session()
+        self.root.destroy()
 
 
 def main():
@@ -1178,7 +1680,7 @@ def main():
         ttk.Style().theme_use("clam")
     except tk.TclError:
         pass
-    app = ImageMeasureApp(root)
+    App(root)
     root.mainloop()
 
 

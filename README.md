@@ -1,7 +1,9 @@
 # Image Measure Tool
 
 A desktop tool for measuring real-world distances from a photo, with X/Y/Z axis
-color-coding, cross-line comparisons, and parallel-line drawing.
+color-coding, cross-line comparisons, and parallel-line drawing. Each open
+photo lives in its own tab, and the whole window -- every tab, even ones you
+never explicitly saved -- is remembered automatically between runs.
 
 ## Setup
 
@@ -9,10 +11,10 @@ color-coding, cross-line comparisons, and parallel-line drawing.
 pip install pillow tkinterdnd2
 ```
 
-`tkinterdnd2` is optional and only enables dragging an image file onto the
-window to open it -- everything else works without it, you'd just use
-File > Open Image instead. (Tkinter ships with the standard Python installer
-on Windows/macOS. On Linux, install your distro's `python3-tk` package if
+`tkinterdnd2` is optional and only enables dragging an image file onto a tab
+to open it -- everything else works without it, you'd just use File > Open
+Image instead. (Tkinter ships with the standard Python installer on
+Windows/macOS. On Linux, install your distro's `python3-tk` package if
 `import tkinter` fails.)
 
 ## Run
@@ -21,10 +23,58 @@ on Windows/macOS. On Linux, install your distro's `python3-tk` package if
 python image_measure_tool.py
 ```
 
+## Tabs
+
+- Every open photo/project is its own tab, with its own image, lines, zoom
+  and pan -- so you can work on several at once. **New Tab** (Ctrl+T) or
+  **File > Open Image** (Ctrl+O) starts another; the small **✕** on a tab
+  closes it (middle-click a tab, or Ctrl+W / File > Close Tab, do the same
+  thing). If a tab has measurements that were never saved as a project
+  file, closing it asks you to confirm first.
+- The color/mode toolbar at the top and the Edit menu always act on
+  whichever tab is currently in front.
+- Dragging an image onto a tab that already has one open loads it into a
+  **new** tab instead of replacing what's there; dropping it onto an empty
+  tab loads it right there.
+
+## Where things are saved
+
+There are two separate kinds of file, for two separate purposes:
+
+- **Project files** (`File > Save Project`, `.imt`) are the deliberate,
+  portable save format -- one file per project, containing that tab's image
+  path, **a full copy of the image itself**, its rotation, and every line
+  (color, endpoints, known length, unit). Because the image is embedded,
+  the project still opens correctly even if the photo gets moved, renamed,
+  or the `.imt` file ends up on a different computer without it -- opening
+  it just falls back to the embedded copy and tells you so in the status
+  bar. The tradeoff is size: a `.imt` file is roughly the image's size plus
+  ~33% (base64 encoding overhead), so it's noticeably bigger than the photo
+  alone -- fine for normal use, just don't be surprised. (Older projects
+  saved as `.imt.json` before this still open fine; they just don't have an
+  embedded image, so if the original file has also moved you'll be asked to
+  locate it, same as before.) Save it next to the photo, move it, share it,
+  keep it in version control -- it's a normal file you control.
+- **The session** is a small file the app writes to on its own, every time
+  it closes (and every minute while it's open, in case of a crash): which
+  tabs were open and every line in them, whether or not you ever hit Save
+  Project. The next time you launch the app, it's read back automatically
+  and the window comes back exactly as you left it. It lives in your
+  per-user app-data folder (`%APPDATA%\ImageMeasureTool\session.json` on
+  Windows; `~/Library/Application Support/ImageMeasureTool/session.json` on
+  macOS; `~/.config/ImageMeasureTool/session.json` on Linux) rather than
+  next to the script, so it stays local to each computer instead of getting
+  synced by OneDrive/Git, and each machine keeps its own "last state"
+  independently.
+
+Closing a tab with the ✕ removes it right away, even from the session --
+only tabs still open when the app quits get carried forward automatically.
+If you want a project to survive on its own regardless, use Save Project.
+
 ## How it works
 
-- **File > Open Image** loads a photo, or just drag an image file onto the
-  window (needs `tkinterdnd2` -- see Setup). A photo from a phone or camera
+- **File > Open Image** loads a photo, or just drag an image file onto a
+  tab (needs `tkinterdnd2` -- see Setup). A photo from a phone or camera
   that comes in sideways is automatically rotated to match how Windows/Photos
   displays it (both read the same EXIF orientation tag in the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
@@ -47,6 +97,8 @@ python image_measure_tool.py
   list below) and typing into that same field.
 - **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
   clockwise and keeps every line attached to the same spot on the picture.
+  This rotation is remembered along with the project/session, so reopening
+  a rotated project shows it rotated the same way.
 - Once one line of a color has a known length, every other line of that same
   color automatically shows a computed real-world length, both on the canvas
   and in the side list -- because the tool now knows that color's
@@ -69,9 +121,11 @@ python image_measure_tool.py
   exactly onto that vertex, so segments measuring different axes can share
   a precise corner (e.g. a red X-edge and a green Y-edge meeting at the same
   pixel).
-- **Save Project / Open Project** stores the image path and every line
-  (color, endpoints, known length, unit) in a `.json` file so you can pick up
-  where you left off.
+- **Save Project / Open Project** stores the image path, a copy of the image
+  itself, rotation, and every line (color, endpoints, known length, unit) in
+  a single `.imt` file so you can pick up where you left off -- even from
+  another computer. See "Where things are saved" above for how this differs
+  from the automatic session.
 - **Export Measurements (CSV)** dumps every line's pixel length, computed
   real length, unit, color/axis, and endpoints to a spreadsheet-friendly file.
 
@@ -93,3 +147,10 @@ python image_measure_tool.py
   dragging out a new line, the line's start point stays pinned to the actual
   spot on the photo you clicked, instead of stretching to wherever that
   screen pixel ended up.
+- This is the mirror image of the other direction: the `.imt` project file
+  embeds a copy of the *photo* so it's self-contained, but measurements
+  still don't get written into the photo's own metadata (EXIF/XMP for JPEG,
+  a text chunk for PNG). That's a deliberate choice -- some tools strip
+  embedded metadata on re-save, and it's harder to inspect/diff than the
+  `.imt` file -- but ask if it'd be useful as an additional, optional
+  export and it can be added.
