@@ -200,26 +200,47 @@ If you want a project to survive on its own regardless, use Save Project.
   both by clicking on the photo or by clicking a row in the side list, in
   any combination. Esc cancels at any point, and pressing **P** (or the
   button) again while it's active cancels it too.
-- **Editing endpoints**: hover over the end of a line drawn in the *current*
-  color and the cursor turns into a move icon -- drag it to reposition that
-  point. Hover over the end of a line in a *different* color and the cursor
-  turns into a hand instead: starting a new line there snaps its start point
-  exactly onto that vertex, so segments measuring different axes can share
-  a precise corner (e.g. a red X-edge and a green Y-edge meeting at the same
-  pixel).
+- **Chaining a new line onto an existing vertex**: hover over the end of any
+  line -- same color or different -- and the cursor turns into a hand;
+  clicking there and dragging away starts a brand-new line with its start
+  point snapped exactly onto that vertex, so segments measuring different
+  axes (or another line of the same axis) can share a precise corner (e.g. a
+  red X-edge and a green Y-edge meeting at the same pixel). It never moves
+  the vertex you clicked on -- to move an existing point, see Shift+drag
+  below.
 - **Ctrl+click** selects whatever line is under the cursor, whatever color it
   is and whatever mode (Draw or Select) you're in -- clicking a second line
   while holding Ctrl adds it to the selection, and Ctrl-clicking an
   already-selected line removes it. A Ctrl+click on empty space leaves the
   current selection alone rather than clearing it.
 - **Shift+drag** moves an existing line, any color, in either mode: grab one
-  of its endpoints and only that point moves (same as dragging a *current*-color
-  endpoint in Draw mode, just without needing the colors to match). Grab
-  anywhere else along the line's body and the whole line translates -- both
-  endpoints shift by the same amount, so its length and direction stay
-  exactly the same, just moved. Shift-dragging on empty canvas still works
-  as before (constrains a new line parallel to the reference); this only
-  kicks in when Shift-grabbing an existing line or vertex.
+  of its endpoints and only that point moves. Grab anywhere else along the
+  line's body and the whole line translates -- both endpoints shift by the
+  same amount, so its length and direction stay exactly the same, just
+  moved. Shift-dragging on empty canvas still works as before (constrains a
+  new line parallel to the reference); this only kicks in when
+  Shift-grabbing an existing line or vertex.
+  - Grabbing a vertex with a quick Shift+**click** (rather than holding the
+    button down) picks the point up instead: it detaches and follows the
+    cursor -- no button held -- until you click again to place it, the
+    same click-then-click pattern as drawing a line. While it's following,
+    hold Shift to keep it exactly collinear with the line's *original*
+    direction, so you can extend or shorten the line precisely along its
+    own axis (handy when the endpoint you're chasing is far away, or you
+    want to zoom/pan first without having to keep the mouse button held
+    the whole time). Let go of Shift mid-follow and it moves freely again;
+    hold it again on the finishing click to snap back in line. Esc cancels
+    and puts the point back exactly where it was. An actual press-and-hold
+    drag past the usual click threshold still finalizes immediately on
+    release, same as before -- this is only for a genuine short click.
+- **Snap Mode** (toolbar checkbox, Edit menu, or press **S**): while on,
+  placing or moving a point -- drawing a new line's endpoints, or
+  Shift-dragging an existing vertex -- pulls it onto a nearby vertex first,
+  or the nearest point along a nearby line's body if no vertex is close
+  enough, within the same hit-test distance used for clicking a line. A
+  point never snaps onto the very line/vertex it's already part of. Off by
+  default; toggling it back off goes back to placing points exactly where
+  you click.
 - **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
   drawing a line, deleting line(s), dragging an endpoint (one step per drag,
   not per pixel it moved), Make Parallel, a known-length or Display-section

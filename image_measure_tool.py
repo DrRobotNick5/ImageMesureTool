@@ -463,6 +463,19 @@ class ProjectTab(ttk.Frame):
         self.press_canvas = None          # (x, y) where the current press started
         self.press_moved = False          # did the mouse move past the click threshold?
         self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
+        # Vertex-move follow state -- see _constrained_vertex_point,
+        # on_canvas_press's vertex_follow_active check, and
+        # cancel_vertex_follow. A Shift+click on a vertex that releases
+        # without dragging past the threshold detaches that endpoint and
+        # has it follow the cursor (like click-to-click line drawing) until
+        # the next click places it; holding Shift while it follows keeps it
+        # collinear with the line's original direction, for extending or
+        # shortening a line precisely.
+        self.vertex_follow_active = False
+        self.vertex_move_anchor = None    # (ax, ay, orig_angle) of the line's OTHER,
+                                            # fixed endpoint and its pre-move direction
+        self.vertex_move_orig = None      # (ox, oy) the moved endpoint had before this
+                                            # gesture started, to restore on Escape
         # "Make Parallel" tool state -- see start_make_parallel/_maybe_advance_parallel_pick.
         # None while inactive; "first" while waiting to pick the reference
         # line; "second" while waiting to pick the line that gets rotated
@@ -705,6 +718,9 @@ class ProjectTab(ttk.Frame):
         self.image_path = display_path
         self.dragging_vertex = None
         self.moving_line = None
+        self.vertex_follow_active = False
+        self.vertex_move_anchor = None
+        self.vertex_move_orig = None
         self.drag_start_img = None
         self.drag_temp_id = None
         self.click_draw_start = None
@@ -1003,17 +1019,55 @@ class ProjectTab(ttk.Frame):
         return best
 
     @staticmethod
-    def _point_segment_distance(p, a, b):
+    def _nearest_point_on_segment(p, a, b):
         ax, ay = a
         bx, by = b
         px, py = p
         dx, dy = bx - ax, by - ay
         length2 = dx * dx + dy * dy
         if length2 == 0:
-            return dist(p, a)
+            return a
         t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / length2))
-        proj = (ax + t * dx, ay + t * dy)
-        return dist(p, proj)
+        return (ax + t * dx, ay + t * dy)
+
+    @classmethod
+    def _point_segment_distance(cls, p, a, b):
+        return dist(p, cls._nearest_point_on_segment(p, a, b))
+
+    def _apply_snap(self, ix, iy, exclude_ids=()):
+        """When Snap Mode is on, pull the image-space point (ix, iy) onto
+        the nearest OTHER line's vertex within the usual hit-test
+        tolerance, else the nearest point along that line's body, else
+        leave it untouched. A vertex match wins over a mid-line match even
+        if the mid-line point happens to be marginally closer, since
+        landing exactly on an existing corner is normally what you want.
+        exclude_ids skips lines that shouldn't act as snap targets for this
+        particular point -- e.g. the line whose own vertex is being
+        dragged, so it doesn't snap onto its own other endpoint or its own
+        body. Used for both drawing new lines and Shift-dragging an
+        existing vertex; not applied to a Shift-dragged whole-line move
+        (translation, not point-placement)."""
+        if not self.app.snap_mode.get():
+            return ix, iy
+        tol_img = HIT_TOLERANCE / self.scale
+        best_pt, best_d = None, tol_img
+        for ln in self.lines:
+            if ln.id in exclude_ids:
+                continue
+            for vx, vy in ((ln.x1, ln.y1), (ln.x2, ln.y2)):
+                d = dist((ix, iy), (vx, vy))
+                if d <= best_d:
+                    best_pt, best_d = (vx, vy), d
+        if best_pt is not None:
+            return best_pt
+        for ln in self.lines:
+            if ln.id in exclude_ids:
+                continue
+            proj = self._nearest_point_on_segment((ix, iy), (ln.x1, ln.y1), (ln.x2, ln.y2))
+            d = dist((ix, iy), proj)
+            if d <= best_d:
+                best_pt, best_d = proj, d
+        return best_pt if best_pt is not None else (ix, iy)
 
     def _parallel_reference(self):
         """The line a Shift-constrained drag should run parallel to: the
@@ -1025,14 +1079,37 @@ class ProjectTab(ttk.Frame):
                 return ln
         return self.lines[-1] if self.lines else None
 
+    @staticmethod
+    def _project_onto_direction(ax, ay, px, py, angle):
+        """Project (px, py) onto the line through (ax, ay) running in the
+        given direction (radians)."""
+        dirx, diry = math.cos(angle), math.sin(angle)
+        vx, vy = px - ax, py - ay
+        proj_len = vx * dirx + vy * diry
+        return ax + proj_len * dirx, ay + proj_len * diry
+
     def _constrain_to_reference(self, ix1, iy1, ix2, iy2, ref):
         """Project (ix2, iy2) onto the line through (ix1, iy1) running in
         ref's direction, so the new segment is parallel to ref."""
-        ang = ref.angle()
-        dirx, diry = math.cos(ang), math.sin(ang)
-        vx, vy = ix2 - ix1, iy2 - iy1
-        proj_len = vx * dirx + vy * diry
-        return ix1 + proj_len * dirx, iy1 + proj_len * diry
+        return self._project_onto_direction(ix1, iy1, ix2, iy2, ref.angle())
+
+    def _constrained_vertex_point(self, ln, anchor, orig_angle, ix, iy, shift_held):
+        """Where a vertex being moved (drawing aside -- this is for an
+        EXISTING line's endpoint via Shift+grab) should land right now.
+        Shift held: project onto the ray through `anchor` -- the line's
+        OTHER, fixed endpoint -- running in `orig_angle`, the line's own
+        direction as of the moment this move started (captured once, not
+        re-read live, since the line's current angle changes as the point
+        moves). That's what lets you extend or shorten a line while
+        keeping it perfectly collinear with itself, the vertex-move
+        equivalent of Shift constraining a new line parallel to a
+        reference. Shift not held: the point moves freely. Either way,
+        Snap Mode (if on) is applied last, excluding this line itself so
+        it never snaps onto its own other endpoint or its own body."""
+        if shift_held:
+            ax, ay = anchor
+            ix, iy = self._project_onto_direction(ax, ay, ix, iy, orig_angle)
+        return self._apply_snap(ix, iy, exclude_ids=(ln.id,))
 
     # --------------------------------------------------- make-parallel tool
     def start_make_parallel(self):
@@ -1231,6 +1308,30 @@ class ProjectTab(ttk.Frame):
             self._finalize_line(ix1, iy1, ix2, iy2, bool(event.state & 0x0001))
             return
 
+        # A vertex picked up with Shift+click (released without dragging
+        # past the threshold -- see on_canvas_release) is following the
+        # cursor right now, waiting for this next click to place it. Hold
+        # Shift on this closing click too to keep it collinear with the
+        # line's original direction.
+        if self.vertex_follow_active:
+            ln, idx = self.dragging_vertex
+            ix2, iy2 = self.canvas_event_to_img(event)
+            ax, ay, orig_angle = self.vertex_move_anchor
+            fx, fy = self._constrained_vertex_point(
+                ln, (ax, ay), orig_angle, ix2, iy2, bool(event.state & 0x0001))
+            if idx == 1:
+                ln.x1, ln.y1 = fx, fy
+            else:
+                ln.x2, ln.y2 = fx, fy
+            self.vertex_follow_active = False
+            self.dragging_vertex = None
+            self.vertex_move_anchor = None
+            self.vertex_move_orig = None
+            self.redraw()
+            self.mark_dirty()
+            self.app.set_status(f"Moved line #{ln.id}'s endpoint.")
+            return
+
         ix, iy = self.canvas_event_to_img(event)
         tol_img = HIT_TOLERANCE / self.scale
 
@@ -1246,24 +1347,34 @@ class ProjectTab(ttk.Frame):
             return
 
         # Shift+grab moves an existing line, any color, in either mode:
-        # grabbing one of its endpoints moves just that point; grabbing the
-        # line's body anywhere else translates the whole line (both
-        # endpoints shift by the same amount, so its length and direction
-        # don't change). A miss (nothing under the cursor) falls through to
-        # the normal per-mode behavior below, so Shift-drag on empty canvas
-        # in Draw mode still means "constrain the new line parallel to the
-        # reference", same as before.
+        # grabbing one of its endpoints moves just that point (dragging it
+        # directly if you keep the button held, or -- if you just click and
+        # let go -- picking it up to follow the cursor until the next
+        # click, so you can hold Shift afterward to extend/shorten it along
+        # its own direction; see the vertex_follow_active handling above and
+        # in on_canvas_release). Grabbing the line's body anywhere else
+        # translates the whole line (both endpoints shift by the same
+        # amount, so its length and direction don't change). A miss
+        # (nothing under the cursor) falls through to the normal per-mode
+        # behavior below, so Shift-drag on empty canvas in Draw mode still
+        # means "constrain the new line parallel to the reference", same as
+        # before.
         if bool(event.state & 0x0001):  # Shift
             hit = self.find_vertex_near(ix, iy, tol_img)
             if hit:
                 vline, vidx = hit
-                # Pushed here, at the start of the drag, not per pixel of
-                # movement -- one undo step per drag gesture (a press+release
-                # with no actual movement just pushes a harmless no-op
-                # snapshot, same as the same-color vertex drag below).
+                # Pushed here, at the start of the gesture, not per pixel of
+                # movement -- one undo step for the whole thing (a
+                # press+release with no actual movement just pushes a
+                # harmless no-op snapshot).
                 self._push_undo()
                 self.dragging_vertex = (vline, vidx)
                 self.drag_start_img = None
+                self.vertex_move_orig = (vline.x1, vline.y1) if vidx == 1 else (vline.x2, vline.y2)
+                other = (vline.x2, vline.y2) if vidx == 1 else (vline.x1, vline.y1)
+                self.vertex_move_anchor = (other[0], other[1], vline.angle())
+                self.press_canvas = (event.x, event.y)
+                self.press_moved = False
                 self.select_line(vline.id)
                 return
             ln = self.find_line_near(ix, iy, tol_img)
@@ -1281,26 +1392,17 @@ class ProjectTab(ttk.Frame):
                 self.select_line(None)
             return
 
-        # draw mode: hovering an endpoint either moves it (same color as the
-        # one you've got selected to draw with) or snaps a new line's start
-        # to it (different color -- chaining a segment onto another axis).
+        # draw mode: hovering an endpoint -- of ANY color, same or different
+        # -- snaps a new line's start to it (chaining a segment onto that
+        # exact point, e.g. sharing a corner between axes, or continuing a
+        # line of the same color). Moving an existing vertex is Shift+grab
+        # now (handled above), not a plain click here.
         self.dragging_vertex = None
         self.press_canvas = (event.x, event.y)
         self.press_moved = False
         hit = self.find_vertex_near(ix, iy, tol_img)
         if hit:
             vline, vidx = hit
-            if vline.color == self.app.current_color.get():
-                # Pushed here, at the start of the drag, not per pixel of
-                # movement in on_canvas_drag -- one undo step per drag
-                # gesture, restoring to before this vertex moved at all
-                # (a press+release with no actual movement just pushes a
-                # harmless no-op snapshot).
-                self._push_undo()
-                self.dragging_vertex = (vline, vidx)
-                self.drag_start_img = None
-                self.select_line(vline.id)
-                return
             vx, vy = (vline.x1, vline.y1) if vidx == 1 else (vline.x2, vline.y2)
             self.drag_start_img = (vx, vy)
             self.drag_temp_id = None
@@ -1313,7 +1415,7 @@ class ProjectTab(ttk.Frame):
         # from the image-space anchor on every drag/release call (below)
         # keeps the line's start point pinned to the actual photo content
         # instead of stretching to wherever that canvas pixel ended up.
-        self.drag_start_img = (ix, iy)
+        self.drag_start_img = self._apply_snap(ix, iy)
         self.drag_temp_id = None
 
     def on_canvas_drag(self, event):
@@ -1322,7 +1424,19 @@ class ProjectTab(ttk.Frame):
 
         if self.dragging_vertex is not None:
             ln, idx = self.dragging_vertex
+            # Once the mouse has moved far enough, this press-and-hold
+            # counts as a real drag (finalized immediately on release); a
+            # release before crossing this threshold is a short click
+            # instead, which picks the vertex up to follow the cursor (see
+            # on_canvas_release / on_canvas_press's vertex_follow_active
+            # check) rather than finalizing anything here.
+            if self.press_canvas is not None and \
+                    dist((event.x, event.y), self.press_canvas) >= CLICK_MOVE_THRESHOLD:
+                self.press_moved = True
             ix, iy = self.canvas_to_img(event.x, event.y)
+            ax, ay, orig_angle = self.vertex_move_anchor
+            ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
+                                                      bool(event.state & 0x0001))
             if idx == 1:
                 ln.x1, ln.y1 = ix, iy
             else:
@@ -1369,6 +1483,11 @@ class ProjectTab(ttk.Frame):
                 ex, ey = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 cx, cy = self.img_to_canvas(ex, ey)
 
+        if self.app.snap_mode.get():  # Snap Mode: pull onto nearby geometry
+            ix2, iy2 = self.canvas_to_img(cx, cy)
+            sx2, sy2 = self._apply_snap(ix2, iy2)
+            cx, cy = self.img_to_canvas(sx2, sy2)
+
         color_hex = AXIS_COLORS[self.app.current_color.get()]["hex"]
         if self.drag_temp_id:
             self.canvas.coords(self.drag_temp_id, sx, sy, cx, cy)
@@ -1377,11 +1496,32 @@ class ProjectTab(ttk.Frame):
                 sx, sy, cx, cy, fill=color_hex, width=2, dash=(4, 2))
 
     def on_canvas_hover(self, event):
-        """No button held. While a click-started line is pending, this is
-        what drives its live preview towards the cursor. Otherwise it just
-        updates the cursor to hint what a click here would do (move a
-        vertex vs. snap-start a new line vs. plain draw)."""
-        if not self.pil_image or self.app.mode.get() != "draw":
+        """No button held. While a click-started line, or a picked-up
+        vertex, is pending, this is what drives its live preview towards
+        the cursor. Otherwise it just updates the cursor to hint what a
+        click here would do (snap-start a new line at a vertex vs.
+        Shift+grab to move something vs. plain draw)."""
+        if not self.pil_image:
+            return
+
+        # A vertex picked up with Shift+click is following the cursor until
+        # the next click places it (see on_canvas_release / on_canvas_press).
+        # This works in either Draw or Select mode -- Shift+grab does too --
+        # so it's checked before the Draw-mode-only logic below.
+        if self.vertex_follow_active:
+            ln, idx = self.dragging_vertex
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            ax, ay, orig_angle = self.vertex_move_anchor
+            ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
+                                                      bool(event.state & 0x0001))
+            if idx == 1:
+                ln.x1, ln.y1 = ix, iy
+            else:
+                ln.x2, ln.y2 = ix, iy
+            self.redraw()
+            return
+
+        if self.app.mode.get() != "draw":
             return
 
         if self.click_draw_start is not None:
@@ -1401,9 +1541,7 @@ class ProjectTab(ttk.Frame):
             return
 
         hit = self.find_vertex_near(ix, iy, tol_img)
-        if hit and hit[0].color == self.app.current_color.get():
-            self.canvas.config(cursor="fleur")
-        elif hit:
+        if hit:
             self.canvas.config(cursor="hand2")
         else:
             self.canvas.config(cursor="crosshair")
@@ -1414,7 +1552,24 @@ class ProjectTab(ttk.Frame):
 
         if self.dragging_vertex is not None:
             ln, idx = self.dragging_vertex
+            if not self.press_moved:
+                # A short click, not a drag: the vertex detaches and
+                # follows the cursor instead of finalizing anything here --
+                # same click-to-click pattern as drawing a new line. Lets
+                # you let go of the mouse button and then hold Shift to
+                # extend/shorten the line precisely along its own
+                # direction, without having to keep the button held the
+                # whole time. The next click (on_canvas_press) places it,
+                # or Esc cancels it.
+                self.vertex_follow_active = True
+                self.app.set_status("Moving this point -- click again to "
+                                     "place it (hold Shift to keep it in "
+                                     "line with the rest of the line), or "
+                                     "Esc to cancel.")
+                return
             self.dragging_vertex = None
+            self.vertex_move_anchor = None
+            self.vertex_move_orig = None
             self.redraw()
             self.mark_dirty()
             self.app.set_status(f"Moved line #{ln.id}'s endpoint.")
@@ -1463,6 +1618,9 @@ class ProjectTab(ttk.Frame):
                 ix2, iy2 = self._constrain_to_reference(ix1, iy1, ix2, iy2, ref)
                 parallel_to = ref.id
 
+        if self.app.snap_mode.get():
+            ix2, iy2 = self._apply_snap(ix2, iy2)
+
         if dist((ix1, iy1), (ix2, iy2)) < 3 / self.scale:
             self.app.set_status("Line too short -- not created.")
             return
@@ -1502,6 +1660,7 @@ class ProjectTab(ttk.Frame):
         """Called for the active tab whenever the shared draw/select mode
         changes, and again right after this tab becomes active (in case the
         mode changed while it was in the background)."""
+        self.cancel_vertex_follow()
         self.dragging_vertex = None
         self.moving_line = None
         self.drag_start_img = None
@@ -1519,6 +1678,30 @@ class ProjectTab(ttk.Frame):
             self.canvas.delete(self.drag_temp_id)
             self.drag_temp_id = None
         self.app.set_status("Line cancelled.")
+
+    def cancel_vertex_follow(self):
+        """Escape, or switching modes/tabs/images: abandon a vertex that
+        was picked up with Shift+click (released without dragging) and is
+        following the cursor, putting it back exactly where it was before
+        the pickup and discarding the undo snapshot pushed for this
+        gesture -- nothing actually ended up changing, so it shouldn't
+        leave a no-op entry in the undo history."""
+        if not self.vertex_follow_active:
+            return
+        ln, idx = self.dragging_vertex
+        ox, oy = self.vertex_move_orig
+        if idx == 1:
+            ln.x1, ln.y1 = ox, oy
+        else:
+            ln.x2, ln.y2 = ox, oy
+        if self.undo_stack:
+            self.undo_stack.pop()
+        self.vertex_follow_active = False
+        self.dragging_vertex = None
+        self.vertex_move_anchor = None
+        self.vertex_move_orig = None
+        self.redraw()
+        self.app.set_status("Vertex move cancelled.")
 
     def cycle_color(self, direction=1):
         """Tab (Shift+Tab to go backward) switches the active line color
@@ -1600,9 +1783,10 @@ class ProjectTab(ttk.Frame):
     def on_escape_key(self):
         """Escape either reverts an in-progress known-length edit back to
         its pre-edit value (if that field has focus), cancels an in-
-        progress Make Parallel pick, or -- otherwise -- cancels a line
-        that was started with a short click and is waiting for its
-        closing click."""
+        progress Make Parallel pick, cancels a vertex that's mid-follow
+        after a Shift+click pickup, or -- otherwise -- cancels a line that
+        was started with a short click and is waiting for its closing
+        click."""
         focused = self.app.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
             self.cancel_length_edit()
@@ -1610,6 +1794,9 @@ class ProjectTab(ttk.Frame):
             return
         if self.parallel_picking:
             self.cancel_make_parallel()
+            return
+        if self.vertex_follow_active:
+            self.cancel_vertex_follow()
             return
         self.cancel_click_draw()
 
@@ -2086,6 +2273,13 @@ class App:
         # Display section's own mode dropdown is for, per line).
         self.default_display_mode = tk.StringVar(value=DEFAULT_DISPLAY_MODE)
         self.default_display_mode.trace_add("write", self._on_default_display_mode_change)
+        # Snap Mode (toggled by the 'S' key, the toolbar checkbutton, or the
+        # Edit menu) -- while on, placing or moving a vertex (drawing a new
+        # line's endpoints, or Shift-dragging an existing one) pulls it onto
+        # a nearby vertex first, else the nearest point along a nearby
+        # line's body, within the usual hit-test tolerance. See
+        # ProjectTab._apply_snap.
+        self.snap_mode = tk.BooleanVar(value=False)
 
         self._build_menu()
         self._build_toolbar()
@@ -2101,6 +2295,8 @@ class App:
         self.root.bind("<BackSpace>", self._delete_selected_shortcut)
         self.root.bind("<p>", self._make_parallel_shortcut)
         self.root.bind("<P>", self._make_parallel_shortcut)
+        self.root.bind("<s>", self._snap_mode_shortcut)
+        self.root.bind("<S>", self._snap_mode_shortcut)
         self.root.bind("<Tab>", self._on_tab_key)
         self.root.bind("<Shift-Tab>", lambda e: self._on_tab_key(e, direction=-1))
         # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
@@ -2156,6 +2352,7 @@ class App:
                               command=lambda: self._dispatch("compare_selected"))
         editmenu.add_command(label="Make Parallel...", accelerator="P",
                               command=lambda: self._dispatch("toggle_make_parallel"))
+        editmenu.add_checkbutton(label="Snap Mode", accelerator="S", variable=self.snap_mode)
         editmenu.add_separator()
         editmenu.add_command(label="Rotate Image 90°", command=lambda: self._dispatch("rotate_image"))
         menubar.add_cascade(label="Edit", menu=editmenu)
@@ -2267,6 +2464,7 @@ class App:
             bar, text="Make Parallel (P)",
             command=lambda: self._dispatch("toggle_make_parallel"))
         self.parallel_button.pack(side="left", padx=2)
+        ttk.Checkbutton(bar, text="Snap (S)", variable=self.snap_mode).pack(side="left", padx=2)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
@@ -2347,23 +2545,35 @@ class App:
             "or the side list in any combination. Esc cancels.\n"
             "9. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "10. Ctrl+click selects any line under the cursor, whatever color it "
+            "10. Hovering the end of any line (same color or different) turns "
+            "the cursor into a hand -- clicking it and dragging away starts a "
+            "new line snapped onto that exact point, instead of moving it. "
+            "Ctrl+click selects any line under the cursor, whatever color it "
             "is and in either Draw or Select mode -- Ctrl-clicking a second line "
             "adds it to the selection, and Ctrl-clicking a selected line removes "
             "it again. Shift+drag moves an existing line, any color, in either "
             "mode: grab an endpoint and just that point moves; grab anywhere "
             "else on the line and the whole thing translates, keeping its "
-            "length and direction exactly the same.\n"
-            "11. Ctrl+Z undoes and Ctrl+Y (or Ctrl+Shift+Z) redoes -- drawing a "
+            "length and direction exactly the same. Shift+CLICK an endpoint "
+            "(instead of holding the button) picks it up to follow the cursor "
+            "until you click again to place it -- hold Shift while it follows "
+            "to keep it exactly collinear with the line's original direction, "
+            "so you can extend or shorten the line precisely; Esc puts it back.\n"
+            "11. Snap Mode (toolbar checkbox, Edit menu, or press S) makes "
+            "placing or moving a point -- a new line's endpoint, or a vertex "
+            "you're Shift-dragging -- jump onto a nearby vertex, or the nearest "
+            "point along a nearby line if no vertex is close enough. Off by "
+            "default.\n"
+            "12. Ctrl+Z undoes and Ctrl+Y (or Ctrl+Shift+Z) redoes -- drawing a "
             "line, deleting line(s), dragging an endpoint or moving a whole "
             "line, Make Parallel, a known-length or Display-section change, and "
             "Rotate 90° all step back one action at a time. Opening a different "
             "image or project starts that tab's undo history fresh.\n"
-            "12. Save Project keeps one tab's image (a full copy, not just its "
+            "13. Save Project keeps one tab's image (a full copy, not just its "
             "path), rotation, and lines in a single .imt file you can reopen "
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
-            "13. The whole window -- every open tab, saved or not -- is "
+            "14. The whole window -- every open tab, saved or not -- is "
             "remembered automatically and restored next time you launch the app."
         ))
 
@@ -2487,6 +2697,22 @@ class App:
         if self.root.focus_get() in guarded:
             return None
         tab.toggle_make_parallel()
+        return "break"
+
+    def _snap_mode_shortcut(self, event=None):
+        """'S' toggles Snap Mode -- guarded the same way as 'P' (Make
+        Parallel) so typing 's' in a text field isn't hijacked."""
+        tab = self.active_tab()
+        guarded = ()
+        if tab is not None:
+            guarded = (tab.known_length_entry, tab.known_unit_box, tab.display_mode_box,
+                       tab.display_unit_box, tab.display_denominator_box)
+        if self.root.focus_get() in guarded:
+            return None
+        self.snap_mode.set(not self.snap_mode.get())
+        self.set_status(f"Snap mode {'on' if self.snap_mode.get() else 'off'} -- "
+                         f"placing or moving a vertex now "
+                         f"{'snaps to nearby lines/vertices' if self.snap_mode.get() else 'no longer snaps'}.")
         return "break"
 
     def _dispatch(self, method_name, *args):
