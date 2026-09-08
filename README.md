@@ -57,9 +57,10 @@ There are two separate kinds of file, for two separate purposes:
   keep it in version control -- it's a normal file you control.
 - **The session** is a small file the app writes to on its own, every time
   it closes (and every minute while it's open, in case of a crash): which
-  tabs were open and every line in them, whether or not you ever hit Save
-  Project. The next time you launch the app, it's read back automatically
-  and the window comes back exactly as you left it. It lives in your
+  tabs were open and every line in them (whether or not you ever hit Save
+  Project), plus program-wide settings like Default Unit. The next time you
+  launch the app, it's read back automatically and the window comes back
+  exactly as you left it. It lives in your
   per-user app-data folder (`%APPDATA%\ImageMeasureTool\session.json` on
   Windows; `~/Library/Application Support/ImageMeasureTool/session.json` on
   macOS; `~/.config/ImageMeasureTool/session.json` on Linux) rather than
@@ -94,10 +95,24 @@ If you want a project to survive on its own regardless, use Save Project.
   **click again** to finish it wherever you land. **Esc** cancels a line
   started this way before you've closed it. Either way, the finished line is
   selected automatically and the **known length** field in the panel on the
-  left is focused, ready to type into -- no popup. Type a number and press
-  Enter (any unit: mm/cm/m/in/ft/px), or leave it blank; nothing is required,
-  and you can always come back later by clicking the line (or its row in the
-  list below) and typing into that same field.
+  left shows it -- no popup, and nothing is focused yet, so the **Space bar**
+  still switches color immediately if that's what you want to do next. To
+  set the length, just start typing a number -- that's what focuses the
+  field, replacing whatever was there, and it starts out in whatever unit
+  you've set as the **default unit** (Settings menu -- see below) rather
+  than making you re-pick a unit for every line. Enter commits it. While
+  you're editing, **Esc reverts the field to what it was before you started
+  typing** (without changing the line at all) and **Space does the same,
+  then immediately switches color** -- so you can always bail out of an
+  edit and keep moving instead of having to clear it by hand. Nothing is
+  required, and you can always come back later by clicking the line (or
+  its row in the list below) and typing again.
+- **Settings > Default Unit** sets which unit (mm/cm/m/in/ft/px) a newly
+  drawn line starts with, program-wide -- change it once instead of on
+  every line, and it's remembered the same way everything else is (see
+  "Where things are saved" above). Any individual line's unit can still be
+  changed afterward in its own known-length field regardless of this
+  setting.
 - **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
   clockwise and keeps every line attached to the same spot on the picture.
   This rotation is remembered along with the project/session, so reopening
