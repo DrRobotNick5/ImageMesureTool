@@ -207,6 +207,19 @@ If you want a project to survive on its own regardless, use Save Project.
   exactly onto that vertex, so segments measuring different axes can share
   a precise corner (e.g. a red X-edge and a green Y-edge meeting at the same
   pixel).
+- **Ctrl+click** selects whatever line is under the cursor, whatever color it
+  is and whatever mode (Draw or Select) you're in -- clicking a second line
+  while holding Ctrl adds it to the selection, and Ctrl-clicking an
+  already-selected line removes it. A Ctrl+click on empty space leaves the
+  current selection alone rather than clearing it.
+- **Shift+drag** moves an existing line, any color, in either mode: grab one
+  of its endpoints and only that point moves (same as dragging a *current*-color
+  endpoint in Draw mode, just without needing the colors to match). Grab
+  anywhere else along the line's body and the whole line translates -- both
+  endpoints shift by the same amount, so its length and direction stay
+  exactly the same, just moved. Shift-dragging on empty canvas still works
+  as before (constrains a new line parallel to the reference); this only
+  kicks in when Shift-grabbing an existing line or vertex.
 - **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
   drawing a line, deleting line(s), dragging an endpoint (one step per drag,
   not per pixel it moved), Make Parallel, a known-length or Display-section

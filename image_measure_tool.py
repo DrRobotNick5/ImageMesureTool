@@ -455,6 +455,11 @@ class ProjectTab(ttk.Frame):
         self.drag_start_img = None        # (ix, iy) anchor for a hold-and-drag line
         self.drag_temp_id = None          # canvas id of the dashed preview line
         self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
+        self.moving_line = None           # (Line, orig_x1, orig_y1, orig_x2, orig_y2,
+                                            # anchor_ix, anchor_iy) while Shift-dragging a
+                                            # whole line (grabbed by its body, not an
+                                            # endpoint) -- translates both endpoints by the
+                                            # same delta, so orientation/length don't change
         self.press_canvas = None          # (x, y) where the current press started
         self.press_moved = False          # did the mouse move past the click threshold?
         self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
@@ -699,6 +704,7 @@ class ProjectTab(ttk.Frame):
         association no longer apply."""
         self.image_path = display_path
         self.dragging_vertex = None
+        self.moving_line = None
         self.drag_start_img = None
         self.drag_temp_id = None
         self.click_draw_start = None
@@ -1228,10 +1234,49 @@ class ProjectTab(ttk.Frame):
         ix, iy = self.canvas_event_to_img(event)
         tol_img = HIT_TOLERANCE / self.scale
 
+        # Ctrl+click selects whatever line is under the cursor, regardless
+        # of its color and regardless of Draw/Select mode -- a miss does
+        # nothing (it doesn't clear the existing selection, since Ctrl here
+        # means "add/remove this one", not "start over"). This is on top of
+        # (not a replacement for) Select mode's own plain click-to-select.
+        if bool(event.state & 0x0004):  # Control
+            ln = self.find_line_near(ix, iy, tol_img)
+            if ln:
+                self.select_line(ln.id, additive=True)
+            return
+
+        # Shift+grab moves an existing line, any color, in either mode:
+        # grabbing one of its endpoints moves just that point; grabbing the
+        # line's body anywhere else translates the whole line (both
+        # endpoints shift by the same amount, so its length and direction
+        # don't change). A miss (nothing under the cursor) falls through to
+        # the normal per-mode behavior below, so Shift-drag on empty canvas
+        # in Draw mode still means "constrain the new line parallel to the
+        # reference", same as before.
+        if bool(event.state & 0x0001):  # Shift
+            hit = self.find_vertex_near(ix, iy, tol_img)
+            if hit:
+                vline, vidx = hit
+                # Pushed here, at the start of the drag, not per pixel of
+                # movement -- one undo step per drag gesture (a press+release
+                # with no actual movement just pushes a harmless no-op
+                # snapshot, same as the same-color vertex drag below).
+                self._push_undo()
+                self.dragging_vertex = (vline, vidx)
+                self.drag_start_img = None
+                self.select_line(vline.id)
+                return
+            ln = self.find_line_near(ix, iy, tol_img)
+            if ln:
+                self._push_undo()
+                self.moving_line = (ln, ln.x1, ln.y1, ln.x2, ln.y2, ix, iy)
+                self.select_line(ln.id)
+                return
+
         if self.app.mode.get() == "select":
             ln = self.find_line_near(ix, iy, tol_img)
             if ln:
-                self.select_line(ln.id, additive=bool(event.state & 0x0001))  # shift
+                self.select_line(ln.id)
             else:
                 self.select_line(None)
             return
@@ -1282,6 +1327,15 @@ class ProjectTab(ttk.Frame):
                 ln.x1, ln.y1 = ix, iy
             else:
                 ln.x2, ln.y2 = ix, iy
+            self.redraw()
+            return
+
+        if self.moving_line is not None:
+            ln, ox1, oy1, ox2, oy2, aix, aiy = self.moving_line
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            dx, dy = ix - aix, iy - aiy
+            ln.x1, ln.y1 = ox1 + dx, oy1 + dy
+            ln.x2, ln.y2 = ox2 + dx, oy2 + dy
             self.redraw()
             return
 
@@ -1337,6 +1391,15 @@ class ProjectTab(ttk.Frame):
 
         ix, iy = self.canvas_to_img(event.x, event.y)
         tol_img = HIT_TOLERANCE / self.scale
+
+        if bool(event.state & 0x0001) or bool(event.state & 0x0004):  # Shift/Ctrl
+            hit = self.find_vertex_near(ix, iy, tol_img)
+            if hit or self.find_line_near(ix, iy, tol_img):
+                self.canvas.config(cursor="fleur")
+            else:
+                self.canvas.config(cursor="crosshair")
+            return
+
         hit = self.find_vertex_near(ix, iy, tol_img)
         if hit and hit[0].color == self.app.current_color.get():
             self.canvas.config(cursor="fleur")
@@ -1355,6 +1418,14 @@ class ProjectTab(ttk.Frame):
             self.redraw()
             self.mark_dirty()
             self.app.set_status(f"Moved line #{ln.id}'s endpoint.")
+            return
+
+        if self.moving_line is not None:
+            ln = self.moving_line[0]
+            self.moving_line = None
+            self.redraw()
+            self.mark_dirty()
+            self.app.set_status(f"Moved line #{ln.id}.")
             return
 
         if self.drag_start_img is None or self.app.mode.get() != "draw":
@@ -1432,6 +1503,7 @@ class ProjectTab(ttk.Frame):
         changes, and again right after this tab becomes active (in case the
         mode changed while it was in the background)."""
         self.dragging_vertex = None
+        self.moving_line = None
         self.drag_start_img = None
         self.cancel_click_draw()
         self.canvas.config(cursor="crosshair" if self.app.mode.get() == "draw" else "hand2")
@@ -2275,16 +2347,23 @@ class App:
             "or the side list in any combination. Esc cancels.\n"
             "9. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "10. Ctrl+Z undoes and Ctrl+Y (or Ctrl+Shift+Z) redoes -- drawing a "
-            "line, deleting line(s), dragging an endpoint, Make Parallel, a "
-            "known-length or Display-section change, and Rotate 90° all step "
-            "back one action at a time. Opening a different image or project "
-            "starts that tab's undo history fresh.\n"
-            "11. Save Project keeps one tab's image (a full copy, not just its "
+            "10. Ctrl+click selects any line under the cursor, whatever color it "
+            "is and in either Draw or Select mode -- Ctrl-clicking a second line "
+            "adds it to the selection, and Ctrl-clicking a selected line removes "
+            "it again. Shift+drag moves an existing line, any color, in either "
+            "mode: grab an endpoint and just that point moves; grab anywhere "
+            "else on the line and the whole thing translates, keeping its "
+            "length and direction exactly the same.\n"
+            "11. Ctrl+Z undoes and Ctrl+Y (or Ctrl+Shift+Z) redoes -- drawing a "
+            "line, deleting line(s), dragging an endpoint or moving a whole "
+            "line, Make Parallel, a known-length or Display-section change, and "
+            "Rotate 90° all step back one action at a time. Opening a different "
+            "image or project starts that tab's undo history fresh.\n"
+            "12. Save Project keeps one tab's image (a full copy, not just its "
             "path), rotation, and lines in a single .imt file you can reopen "
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
-            "12. The whole window -- every open tab, saved or not -- is "
+            "13. The whole window -- every open tab, saved or not -- is "
             "remembered automatically and restored next time you launch the app."
         ))
 
