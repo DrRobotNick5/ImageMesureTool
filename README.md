@@ -31,8 +31,18 @@ python image_measure_tool.py
   closes it (middle-click a tab, or Ctrl+W / File > Close Tab, do the same
   thing). If a tab has measurements that were never saved as a project
   file, closing it asks you to confirm first.
+- The **Tabs ▾** button in the toolbar, next to New Tab and Close Tab, lists
+  every open tab by name (with a ✓ on whichever one's active) so you can
+  jump straight to one even if it's been clipped off-screen by a narrow
+  window or a lot of open tabs.
 - The color/mode toolbar at the top and the Edit menu always act on
   whichever tab is currently in front.
+- The toolbar itself scrolls horizontally rather than clipping buttons at a
+  narrow window width -- shrink the window enough and a thin scrollbar
+  appears right under it (scroll it with the mouse wheel too, no need to
+  grab the scrollbar itself), so every button stays reachable no matter
+  how small the window gets. It disappears again once the window's wide
+  enough that nothing overflows.
 - Drag either an image **or a `.imt` project file** onto a tab to open it --
   same rule either way: onto a tab that already has something open, it
   loads into a **new** tab; onto an empty tab, it loads right there.
@@ -121,11 +131,14 @@ If you want a project to survive on its own regardless, use Save Project.
   color automatically shows a computed real-world length, both on the canvas
   and in the side list -- because the tool now knows that color's
   pixels-per-unit scale.
-- **Compare 2 Lines**: select any two lines in the side list (Ctrl/Shift-click)
-  and click this button. It computes the second line's real-world length from
-  the pixel-length ratio to the first -- even if they're different colors/axes,
-  and without needing a fully calibrated axis. You can apply the result as
-  that line's known length.
+- **Compare 2 Lines** (Edit menu): select any two lines in the side list
+  (Ctrl/Shift-click) first, then use it. It computes the second line's
+  real-world length from the pixel-length ratio to the first -- even if
+  they're different colors/axes, and without needing a fully calibrated
+  axis. You can apply the result as that line's known length. (Deleting a
+  line is also Edit menu / Delete or BackSpace now -- both used to also
+  have their own toolbar buttons, removed to keep the toolbar to the
+  things you reach for on every line.)
 - **Parallel (Shift)**: hold Shift while dragging a new line and it snaps to
   run parallel to a reference line -- whichever line is selected in the side
   list, or the last line you drew if nothing's selected. The current

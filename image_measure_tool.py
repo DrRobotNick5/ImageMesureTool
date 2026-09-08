@@ -1539,8 +1539,59 @@ class App:
         self.root.config(menu=menubar)
 
     def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=6)
-        bar.pack(side="top", fill="x")
+        # The toolbar is a Canvas with the actual button row embedded in it,
+        # rather than a plain Frame -- a plain Frame just clips whatever
+        # doesn't fit a narrow window with no way to reach it (the same
+        # problem the tab strip had -- see the "Tabs ▾" button above the
+        # notebook). Here the fix is a horizontal scrollbar that only
+        # appears once the buttons actually don't fit, plus the usual
+        # scroll-wheel gestures, so every control stays reachable at any
+        # window size instead of being silently cut off.
+        outer = ttk.Frame(self.root)
+        outer.pack(side="top", fill="x")
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas.pack(side="top", fill="x")
+        self.toolbar_canvas = canvas
+
+        hscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=hscroll.set)
+        self.toolbar_hscroll = hscroll
+        # Not packed yet -- _sync_toolbar_layout() below packs/unpacks it
+        # on demand, only once the content actually overflows the window.
+
+        bar = ttk.Frame(canvas, padding=6)
+        self.toolbar_bar = bar
+        bar_window = canvas.create_window((0, 0), window=bar, anchor="nw")
+
+        def _sync_toolbar_layout(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"),
+                              height=bar.winfo_reqheight())
+            if bar.winfo_reqwidth() > canvas.winfo_width():
+                if not hscroll.winfo_ismapped():
+                    hscroll.pack(side="top", fill="x")
+            elif hscroll.winfo_ismapped():
+                hscroll.pack_forget()
+                canvas.xview_moveto(0)
+
+        def _sync_canvas_item_width(event):
+            # Let the embedded row match the canvas's width when there's
+            # room to spare, but never shrink it below what its content
+            # actually needs -- that's what makes it scroll instead of
+            # squashing the buttons once the window gets narrow.
+            canvas.itemconfigure(bar_window, width=max(event.width, bar.winfo_reqwidth()))
+            _sync_toolbar_layout()
+
+        bar.bind("<Configure>", _sync_toolbar_layout)
+        canvas.bind("<Configure>", _sync_canvas_item_width)
+
+        def _on_toolbar_wheel(event):
+            canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+        canvas.bind("<MouseWheel>", _on_toolbar_wheel)        # Windows/macOS
+        canvas.bind("<Shift-MouseWheel>", _on_toolbar_wheel)
+        canvas.bind("<Button-4>", lambda e: canvas.xview_scroll(-1, "units"))  # Linux
+        canvas.bind("<Button-5>", lambda e: canvas.xview_scroll(1, "units"))
 
         ttk.Label(bar, text="Line color / axis:").pack(side="left", padx=(0, 4))
         for color, meta in AXIS_COLORS.items():
@@ -1557,12 +1608,10 @@ class App:
         ttk.Radiobutton(bar, text="Draw line", variable=self.mode, value="draw").pack(side="left")
         ttk.Radiobutton(bar, text="Select", variable=self.mode, value="select").pack(side="left")
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Compare 2 Lines",
-                   command=lambda: self._dispatch("compare_selected")).pack(side="left", padx=2)
-        ttk.Button(bar, text="Delete",
-                   command=lambda: self._dispatch("delete_selected")).pack(side="left", padx=2)
-
+        # Compare 2 Lines / Delete used to also have toolbar buttons here --
+        # removed to declutter; both are still reachable from the Edit menu
+        # ("Compare Selected Two Lines...", "Delete Selected Line(s)"), and
+        # Delete/BackSpace still delete the selection directly.
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="Zoom In", command=lambda: self._dispatch("zoom", 1.25)).pack(side="left", padx=2)
         ttk.Button(bar, text="Zoom Out", command=lambda: self._dispatch("zoom", 0.8)).pack(side="left", padx=2)
@@ -1572,6 +1621,15 @@ class App:
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
         ttk.Button(bar, text="Close Tab \u2715", command=self.close_active_tab).pack(side="left", padx=2)
+        # ttk.Notebook doesn't scroll or wrap when there are more tabs than
+        # fit the window -- it just clips the overflow ones with no way to
+        # click them -- so this dropdown is the fallback that always reaches
+        # every open tab regardless of window width or how many are open.
+        # Always visible (not just when tabs overflow), right alongside the
+        # other tab controls.
+        self.tabs_menu_button = ttk.Button(bar, text="Tabs \u25be", width=9,
+                                            command=self._show_tabs_menu)
+        self.tabs_menu_button.pack(side="left", padx=2)
 
         self.parallel_hint = ttk.Label(bar, text="", foreground="#a05a00")
         self.parallel_hint.pack(side="left", padx=10)
@@ -1590,7 +1648,9 @@ class App:
         messagebox.showinfo("How to use", (
             "1. Each open photo lives in its own tab -- use New Tab (Ctrl+T) or "
             "File > Open Image (Ctrl+O) to start another; the \u2715 on a tab (or "
-            "middle-click, or Ctrl+W) closes it.\n"
+            "middle-click, or Ctrl+W) closes it. If you have more tabs open than "
+            "fit the window, the \"Tabs \u25be\" button above the tab strip lists "
+            "every one of them, including any clipped off-screen.\n"
             "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line. "
             "It's selected automatically, and the known-length field on the left "
             "shows it -- but nothing is focused yet, so Space still switches "
@@ -1724,6 +1784,29 @@ class App:
                 text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
         else:
             self.parallel_hint.config(text="")
+
+    def _build_tabs_menu(self):
+        """Every open tab, by name -- including ones whose on-screen tab
+        button is currently clipped off the notebook's tab strip (too many
+        tabs to fit the window). Split out from _show_tabs_menu so it can be
+        inspected directly without actually popping up a live menu."""
+        menu = tk.Menu(self.root, tearoff=0)
+        active = self.active_tab()
+        for tab in self._all_tabs():
+            name = ("* " if tab.dirty else "") + tab.display_name()
+            mark = "✓ " if tab is active else "    "
+            menu.add_command(label=mark + name, command=lambda t=tab: self.notebook.select(t))
+        return menu
+
+    def _show_tabs_menu(self):
+        menu = self._build_tabs_menu()
+        btn = self.tabs_menu_button
+        x = btn.winfo_rootx()
+        y = btn.winfo_rooty() + btn.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # -------------------------------------------------------------- opening
     def _open_into_tab(self, loader, prefer_tab=None):
