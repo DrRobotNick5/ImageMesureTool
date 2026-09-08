@@ -870,6 +870,29 @@ class ProjectTab(ttk.Frame):
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image, tags=("bg",))
         self.redraw()
+        self._restore_temp_line()
+
+    def _restore_temp_line(self):
+        """canvas.delete('all') above just wiped the dashed in-progress
+        line preview along with everything else -- redraw() only
+        recreates already-committed lines, so without this a preview that
+        was showing before a zoom/pan/resize would vanish and, worse,
+        STAY hidden: self.drag_temp_id still points at a canvas item that
+        no longer exists, so the next _update_temp_line() call would just
+        call .coords() on that dead id (a silent no-op) instead of
+        creating a fresh one. Reset it here so the next update recreates
+        it -- and if a line is actually mid-draw right now, redraw the
+        preview immediately using the current pointer position rather
+        than waiting for the next mouse-move event, since e.g. a
+        hold-and-drag held steady while zooming with the scroll wheel
+        doesn't itself generate one."""
+        self.drag_temp_id = None
+        anchor = self.drag_start_img or self.click_draw_start
+        if anchor is None or self.app.mode.get() != "draw":
+            return
+        px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+        py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        self._update_temp_line(*anchor, px, py, False)
 
     # ------------------------------------------------------- coord helpers
     def img_to_canvas(self, x, y):
@@ -1062,16 +1085,20 @@ class ProjectTab(ttk.Frame):
                 dist((event.x, event.y), self.press_canvas) >= CLICK_MOVE_THRESHOLD:
             self.press_moved = True
 
-        self._update_temp_line(*self.drag_start_img, event)
+        self._update_temp_line(*self.drag_start_img, event.x, event.y,
+                                bool(event.state & 0x0001))
 
-    def _update_temp_line(self, ix1, iy1, event):
+    def _update_temp_line(self, ix1, iy1, cx, cy, shift_held):
         """Draw/update the dashed preview line from image point (ix1, iy1)
-        to the current cursor, applying the Shift-parallel constraint if
-        held. Shared by hold-and-drag drawing and click-to-click drawing."""
+        to the current cursor position (cx, cy), applying the
+        Shift-parallel constraint if held. Shared by hold-and-drag
+        drawing, click-to-click drawing, and re-establishing the preview
+        after a zoom/pan/resize wipes the canvas mid-draw (see
+        _restore_temp_line) -- that last caller has no real event to read
+        a live Shift state from, so it always passes False."""
         sx, sy = self.img_to_canvas(ix1, iy1)
-        cx, cy = event.x, event.y
 
-        if event.state & 0x0001:  # Shift held: constrain to parallel reference
+        if shift_held:  # Shift held: constrain to parallel reference
             ref = self._parallel_reference()
             if ref:
                 ix2, iy2 = self.canvas_to_img(cx, cy)
@@ -1094,7 +1121,8 @@ class ProjectTab(ttk.Frame):
             return
 
         if self.click_draw_start is not None:
-            self._update_temp_line(*self.click_draw_start, event)
+            self._update_temp_line(*self.click_draw_start, event.x, event.y,
+                                    bool(event.state & 0x0001))
             return
 
         ix, iy = self.canvas_to_img(event.x, event.y)
