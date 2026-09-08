@@ -92,10 +92,11 @@ If you want a project to survive on its own regardless, use Save Project.
   that comes in sideways is automatically rotated to match how Windows/Photos
   displays it (both read the same EXIF orientation tag in the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
-  press the **Space bar** to cycle to the next color, so you don't have to
-  reach for the mouse between measurements. Space is ignored (and can't type
-  a stray space) while the known-length field has focus -- typing a length
-  always takes priority there. These are just labels for three independent
+  press **Tab** (**Shift+Tab** to go back) to cycle to the next color, so you
+  don't have to reach for the mouse between measurements. Tab does this even
+  while the known-length field has focus -- it never jumps to another field
+  there, it cycles the color instead (see below for exactly what it does to
+  the field itself). These are just labels for three independent
   axes you calibrate separately (e.g.
   red for horizontal, green for vertical, blue for depth) -- use them however
   makes sense for your shot.
@@ -105,18 +106,19 @@ If you want a project to survive on its own regardless, use Save Project.
   **click again** to finish it wherever you land. **Esc** cancels a line
   started this way before you've closed it. Either way, the finished line is
   selected automatically and the **known length** field in the panel on the
-  left shows it -- no popup, and nothing is focused yet, so the **Space bar**
+  left shows it -- no popup, and nothing is focused yet, so **Tab**
   still switches color immediately if that's what you want to do next. To
   set the length, just start typing a number -- that's what focuses the
   field, replacing whatever was there, and it starts out in whatever unit
   you've set as the **default unit** (Settings menu -- see below) rather
   than making you re-pick a unit for every line. Enter commits it. While
   you're editing, **Esc reverts the field to what it was before you started
-  typing** (without changing the line at all) and **Space does the same,
-  then immediately switches color** -- so you can always bail out of an
-  edit and keep moving instead of having to clear it by hand. Nothing is
-  required, and you can always come back later by clicking the line (or
-  its row in the list below) and typing again.
+  typing** (without changing the line at all) and **Tab (or Shift+Tab) does
+  the same revert, then immediately switches color** -- so you can always
+  bail out of an edit and keep moving without reaching for the mouse; Tab
+  never jumps to another field while you're editing. Nothing is required,
+  and you can always come back later by clicking the line (or its row in
+  the list below) and typing again.
 - **Settings > Default Unit** sets which unit (mm/cm/m/in/ft/px) a newly
   drawn line starts with, program-wide -- change it once instead of on
   every line, and it's remembered the same way everything else is (see

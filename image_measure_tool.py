@@ -335,7 +335,7 @@ class ProjectTab(ttk.Frame):
         self.press_moved = False          # did the mouse move past the click threshold?
         self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
         self.known_length_edit_snapshot = None  # (length_str, unit_str) before the current
-                                                  # known-length edit, for Escape/Space to revert to
+                                                  # known-length edit, for Escape to revert to
         self._suppress_next_focus_snapshot = False  # see maybe_start_length_edit /
                                                        # _capture_length_edit_snapshot
 
@@ -397,11 +397,6 @@ class ProjectTab(ttk.Frame):
         self.known_length_entry.bind("<Return>", self.commit_known_length)
         self.known_length_entry.bind("<FocusOut>", self.commit_known_length)
         self.known_length_entry.bind("<FocusIn>", self._capture_length_edit_snapshot)
-        # Lengths are numbers -- a space here is never meaningful, so rather
-        # than let it type a literal space, treat it exactly like pressing
-        # Space anywhere else: revert this edit (see cycle_color) and cycle
-        # to the next color.
-        self.known_length_entry.bind("<KeyPress-space>", self._on_space_in_length_field)
 
         self.known_unit_var = tk.StringVar(value=DEFAULT_UNIT)
         self.known_unit_box = ttk.Combobox(
@@ -969,7 +964,7 @@ class ProjectTab(ttk.Frame):
 
         # Deliberately NOT auto-focusing the known-length field here. It's
         # selected and the field shows its current value, ready to edit --
-        # but focus stays wherever it was (the canvas), so Space still cycles
+        # but focus stays wherever it was (the canvas), so Tab still cycles
         # the line color right after finishing a line instead of being eaten
         # by the field, and you're never forced to type immediately. Typing
         # a digit (see maybe_start_length_edit, bound app-wide) is itself
@@ -1004,14 +999,14 @@ class ProjectTab(ttk.Frame):
         self.app.set_status("Line cancelled.")
 
     def cycle_color(self, direction=1):
-        """Space bar switches the active line color (X -> Y -> Z -> X), so
-        you don't have to reach for the mouse mid-measurement. While the
-        known-length field (or its unit box) has focus, Space no longer just
-        gets swallowed -- it reverts whatever's been typed back to the value
-        from before this edit (same as Escape -- see cancel_length_edit),
-        hands focus back to the canvas, and *then* still cycles the color,
-        since a literal space is never meaningful in a number anyway (see
-        the entry's own <KeyPress-space> binding, which routes here)."""
+        """Tab (Shift+Tab to go backward) switches the active line color
+        (X -> Y -> Z -> X), so you don't have to reach for the mouse
+        mid-measurement. While the known-length field (or its unit box)
+        has focus, Tab does NOT move focus to the next widget -- instead
+        it first reverts whatever's been typed back to the value from
+        before this edit (same as Escape -- see cancel_length_edit), hands
+        focus back to the canvas, and *then* still cycles the color, all
+        in one press."""
         focused = self.app.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
             self.cancel_length_edit()
@@ -1026,8 +1021,8 @@ class ProjectTab(ttk.Frame):
         length field -- is treated as "start editing this line's known
         length", replacing whatever was there. This is the only way editing
         starts now: finishing a line no longer force-focuses the field (see
-        _finalize_line), so a stray Space or a moment spent aiming the next
-        line never gets swallowed by it. Bound app-wide (see App.__init__);
+        _finalize_line), so a stray Tab press or a moment spent aiming the
+        next line never gets swallowed by it. Bound app-wide (see App.__init__);
         does nothing unless exactly one line is selected."""
         focused = self.app.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
@@ -1051,21 +1046,12 @@ class ProjectTab(ttk.Frame):
         self.known_length_entry.icursor("end")
         return "break"
 
-    def _on_space_in_length_field(self, event):
-        """The entry's own <KeyPress-space> binding (fires before anything
-        else, since it's bound on the widget itself). Delegates straight to
-        cycle_color, which -- seeing this field still has focus right now --
-        reverts the edit and hands focus back to the canvas before cycling,
-        so typing Space here behaves exactly like Space anywhere else."""
-        self.cycle_color(1)
-        return "break"
-
     def _capture_length_edit_snapshot(self, event=None):
         """FocusIn on the known-length field or its unit box (also called
         directly by maybe_start_length_edit, before it mutates anything):
         remember the value as of *right now*, before any of this edit's
-        keystrokes land, so Escape/Space can restore exactly this if the
-        edit is abandoned."""
+        keystrokes land, so Escape can restore exactly this if the edit is
+        abandoned."""
         if self._suppress_next_focus_snapshot:
             # maybe_start_length_edit already captured the real pre-edit
             # snapshot synchronously; this FocusIn is just the queued side
@@ -1080,7 +1066,7 @@ class ProjectTab(ttk.Frame):
     def cancel_length_edit(self):
         """Throw away whatever's been typed/picked in the known-length field
         (and its unit) since editing started, restoring exactly what was
-        there before -- the shared implementation behind Escape and Space."""
+        there before -- used by Escape and by Tab/Shift-Tab (see cycle_color)."""
         if self.known_length_edit_snapshot is None:
             return False
         length_str, unit_str = self.known_length_edit_snapshot
@@ -1245,8 +1231,8 @@ class ProjectTab(ttk.Frame):
         self.redraw()
         self.populate_known_length_field()
         # This commit is the new baseline -- if editing continues (or resumes
-        # later) and then gets abandoned with Escape/Space, it should revert
-        # to what was *just* committed, not to whatever was there before this
+        # later) and then gets abandoned with Escape, it should revert to
+        # what was *just* committed, not to whatever was there before this
         # whole edit started.
         self.known_length_edit_snapshot = (self.known_length_var.get(), self.known_unit_var.get())
 
@@ -1479,7 +1465,10 @@ class App:
 
         self.root.bind("<Delete>", self._delete_selected_shortcut)
         self.root.bind("<BackSpace>", self._delete_selected_shortcut)
-        self.root.bind("<space>", self._on_space_key)
+        self.root.bind("<Tab>", self._on_tab_key)
+        self.root.bind("<Shift-Tab>", lambda e: self._on_tab_key(e, direction=-1))
+        # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
+        self.root.bind("<ISO_Left_Tab>", lambda e: self._on_tab_key(e, direction=-1))
         self.root.bind("<KeyPress>", self._on_maybe_start_length_edit)
         self.root.bind("<Escape>", lambda e: self._dispatch("on_escape_key"))
         self.root.bind("<Control-o>", lambda e: self.open_image())
@@ -1651,18 +1640,22 @@ class App:
             "middle-click, or Ctrl+W) closes it. If you have more tabs open than "
             "fit the window, the \"Tabs \u25be\" button above the tab strip lists "
             "every one of them, including any clipped off-screen.\n"
-            "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line. "
-            "It's selected automatically, and the known-length field on the left "
-            "shows it -- but nothing is focused yet, so Space still switches "
-            "color right away if that's your next move.\n"
+            "2. Pick Red/Green/Blue (X/Y/Z) and drag on the image to draw a line -- "
+            "or press Tab (Shift+Tab to go back) to cycle the color instead of "
+            "reaching for the mouse. It's selected automatically, and the "
+            "known-length field on the left shows it -- but nothing is focused "
+            "yet, so Tab still switches color right away if that's your next "
+            "move.\n"
             "3. Start typing a number (with the line still selected) to set the "
             "real-world length that line represents (e.g. a known object edge) -- "
             "that's what focuses the field, and new lines start out in "
             "Settings > Default Unit (change it there instead of on every line). "
             "Press Enter to commit it, or leave it blank -- nothing is required. "
             "Esc reverts the field to whatever it was before you started typing, "
-            "and Space reverts it too and immediately switches color, so you can "
-            "always bail out of an edit without committing it.\n"
+            "and Tab (or Shift+Tab) does the same revert and then immediately "
+            "switches color, so you can always bail out of an edit and keep "
+            "moving without touching the mouse -- Tab never jumps to another "
+            "field while you're editing.\n"
             "4. Once one line of a color has a known length, every other line of "
             "that same color shows a computed real-world length automatically -- "
             "shown on the canvas and in the side list.\n"
@@ -1737,9 +1730,9 @@ class App:
         if tab:
             tab.on_mode_changed()
 
-    def _on_space_key(self, event):
+    def _on_tab_key(self, event, direction=1):
         tab = self.active_tab()
-        return tab.cycle_color(1) if tab else None
+        return tab.cycle_color(direction) if tab else None
 
     def _on_maybe_start_length_edit(self, event):
         tab = self.active_tab()
