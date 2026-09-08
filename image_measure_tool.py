@@ -48,6 +48,7 @@ Run:
 
 import ast
 import base64
+import copy
 import io
 import json
 import math
@@ -97,6 +98,7 @@ HANDLE_RADIUS = 5
 HIT_TOLERANCE = 6  # pixels, in canvas/screen space
 CLICK_MOVE_THRESHOLD = 4  # canvas pixels of movement that turns a click into a drag
 PROJECT_EXT = ".imt"
+MAX_UNDO_STEPS = 50
 # .imt.json was this app's project extension before projects started embedding
 # a copy of the image -- still openable, just no longer the default Save name.
 LEGACY_PROJECT_EXT = ".imt.json"
@@ -463,6 +465,13 @@ class ProjectTab(ttk.Frame):
         # once chosen, only meaningful while parallel_picking == "second".
         self.parallel_picking = None
         self.parallel_first_id = None
+        # Undo/redo -- see _push_undo/_restore_snapshot/undo/redo. Each
+        # entry is a full snapshot of everything an action here can
+        # change: the line list, rotation, and (for rotate specifically)
+        # the image/pyramid. Pushed right before a mutation is applied, so
+        # undo restores exactly the state as of just before that action.
+        self.undo_stack = []
+        self.redo_stack = []
         self.known_length_edit_snapshot = None  # (length_str, unit_str) before the current
                                                   # known-length edit, for Escape to revert to
         self._suppress_next_focus_snapshot = False  # see maybe_start_length_edit /
@@ -697,6 +706,9 @@ class ProjectTab(ttk.Frame):
         self.selected_line_ids = []
         self.project_path = None
         self.dirty = False
+        self.undo_stack = []
+        self.redo_stack = []
+        self.cancel_make_parallel()
         self._clear_placeholder()
         self.app.update_tab_title(self)
 
@@ -799,6 +811,7 @@ class ProjectTab(ttk.Frame):
             messagebox.showinfo("No image", "Open an image first.")
             return
         self.cancel_click_draw()
+        self._push_undo()
         old_h = self.pil_image.height
         self.pil_image = self.pil_image.transpose(Image.ROTATE_270)  # 90 deg clockwise
         self.rotation_turns = (self.rotation_turns + 1) % 4
@@ -1110,6 +1123,7 @@ class ProjectTab(ttk.Frame):
 
         use_ang = ref_ang if ang_diff(ref_ang, cur_ang) <= ang_diff(ref_ang + math.pi, cur_ang) \
             else ref_ang + math.pi
+        self._push_undo()
         target.x2 = target.x1 + length * math.cos(use_ang)
         target.y2 = target.y1 + length * math.sin(use_ang)
         target.parallel_to = ref.id
@@ -1118,6 +1132,72 @@ class ProjectTab(ttk.Frame):
         self.app.set_status(
             f"Line #{target.id} ({target.color}) is now parallel to "
             f"line #{ref.id} ({ref.color}).")
+
+    # ------------------------------------------------------------- undo/redo
+    def _snapshot(self):
+        """Everything an undoable action here can change: the line list
+        (deep-copied -- Line objects are mutated in place elsewhere, so a
+        shallow copy of the list would still share the same Line objects
+        and "restoring" it would restore nothing), rotation, and the
+        image/pyramid (only rotate_image actually reassigns these, but
+        capturing a reference here is free -- it's the deep-copy of
+        `lines` that costs anything, and line lists are small)."""
+        return {
+            "lines": copy.deepcopy(self.lines),
+            "rotation_turns": self.rotation_turns,
+            "pil_image": self.pil_image,
+            "pyramid": self.pyramid,
+            "selected_line_ids": list(self.selected_line_ids),
+        }
+
+    def _push_undo(self):
+        """Call right BEFORE applying a mutation, so the pushed snapshot is
+        the state as of just before it. Starting a new undoable action
+        clears the redo stack, same as every other undo/redo implementation --
+        once you've done something new, "redo" no longer means anything."""
+        self.undo_stack.append(self._snapshot())
+        if len(self.undo_stack) > MAX_UNDO_STEPS:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _restore_snapshot(self, snap):
+        # rotate_image is the only action that reassigns pil_image/pyramid
+        # (a new Image object each time, never mutated in place) -- when
+        # a snapshot carries a different one than what's currently shown,
+        # the on-screen background itself needs repainting (_render_image),
+        # not just the line overlay (redraw alone never touches the
+        # background image).
+        image_changed = snap["pil_image"] is not self.pil_image
+        self.lines = snap["lines"]
+        self.rotation_turns = snap["rotation_turns"]
+        self.pil_image = snap["pil_image"]
+        self.pyramid = snap["pyramid"]
+        valid_ids = {ln.id for ln in self.lines}
+        self.selected_line_ids = [i for i in snap["selected_line_ids"] if i in valid_ids]
+        self.mark_dirty()
+        if image_changed:
+            self._render_image()
+        else:
+            self.redraw()
+        self.populate_known_length_field()
+
+    def undo(self):
+        if not self.undo_stack:
+            self.app.set_status("Nothing to undo.")
+            return
+        self.redo_stack.append(self._snapshot())
+        snap = self.undo_stack.pop()
+        self._restore_snapshot(snap)
+        self.app.set_status("Undid last action.")
+
+    def redo(self):
+        if not self.redo_stack:
+            self.app.set_status("Nothing to redo.")
+            return
+        self.undo_stack.append(self._snapshot())
+        snap = self.redo_stack.pop()
+        self._restore_snapshot(snap)
+        self.app.set_status("Redid last undone action.")
 
     def on_canvas_press(self, event):
         if not self.pil_image:
@@ -1166,6 +1246,12 @@ class ProjectTab(ttk.Frame):
         if hit:
             vline, vidx = hit
             if vline.color == self.app.current_color.get():
+                # Pushed here, at the start of the drag, not per pixel of
+                # movement in on_canvas_drag -- one undo step per drag
+                # gesture, restoring to before this vertex moved at all
+                # (a press+release with no actual movement just pushes a
+                # harmless no-op snapshot).
+                self._push_undo()
                 self.dragging_vertex = (vline, vidx)
                 self.drag_start_img = None
                 self.select_line(vline.id)
@@ -1321,6 +1407,7 @@ class ProjectTab(ttk.Frame):
         # Default Unit afterward had no visible effect on this line even
         # though nothing had actually been measured for it yet.
         line = Line(color, ix1, iy1, ix2, iy2, parallel_to=parallel_to)
+        self._push_undo()
         self.lines.append(line)
         self.select_line(line.id)   # also redraws and populates the known-length field
         self.mark_dirty()
@@ -1614,9 +1701,16 @@ class ProjectTab(ttk.Frame):
         mode = self.display_mode_var.get()
         unit = self.display_unit_var.get()
         denom = self.display_denominator_var.get()
-        ln.display_mode = None if mode == "(auto)" else mode
-        ln.display_unit = None if unit == "(auto)" else unit
-        ln.display_denominator = None if denom == "(auto)" else int(denom.split("/")[1])
+        new_mode = None if mode == "(auto)" else mode
+        new_unit = None if unit == "(auto)" else unit
+        new_denom = None if denom == "(auto)" else int(denom.split("/")[1])
+        if (new_mode, new_unit, new_denom) == \
+                (ln.display_mode, ln.display_unit, ln.display_denominator):
+            return  # nothing actually changed -- no undo step, no redraw needed
+        self._push_undo()
+        ln.display_mode = new_mode
+        ln.display_unit = new_unit
+        ln.display_denominator = new_denom
         self._update_denom_row_visibility(ln)
         self.mark_dirty()
         self.redraw()
@@ -1630,9 +1724,9 @@ class ProjectTab(ttk.Frame):
         if not ln:
             return
         text = self.known_length_var.get().strip()
+        new_unit = self.known_unit_var.get().strip() or self.app.default_unit.get()
         if text == "":
-            changed = ln.known_length is not None
-            ln.known_length = None
+            new_value = None
         else:
             parsed = parse_measurement(text)
             if parsed is None:
@@ -1640,25 +1734,27 @@ class ProjectTab(ttk.Frame):
                     "Known length must be a number, fraction, mixed number, or simple "
                     "math (e.g. 2.5, 1/2, 2 1/2, 2 + 1/2) -- or leave it blank.")
                 return
-            value = float(parsed)
-            if value <= 0:
+            new_value = float(parsed)
+            if new_value <= 0:
                 self.app.set_status("Known length must be greater than 0.")
                 return
-            changed = ln.known_length != value
-            ln.known_length = value
-            # Typing a known length no longer has any side effect on
-            # display mode (decimal vs. fraction), for this line or any
-            # other -- it used to auto-lock the whole axis based on
-            # whether the text looked like a fraction ('/') or had a
-            # decimal point, which meant Settings > Default Display Mode
-            # silently stopped doing anything the moment any line on that
-            # axis had ever been typed with a '.', i.e. almost immediately
-            # for most real measurements. Display mode is controlled by
-            # exactly two things now: Settings > Default Display Mode
-            # (applies live, everywhere, to every line with no override),
-            # and the Display section's mode dropdown for a specific line
-            # (an explicit, visible override) -- nothing hidden in between.
-        ln.unit = self.known_unit_var.get().strip() or self.app.default_unit.get()
+        changed = ln.known_length != new_value or ln.unit != new_unit
+        if changed:
+            self._push_undo()
+        ln.known_length = new_value
+        # Typing a known length no longer has any side effect on display
+        # mode (decimal vs. fraction), for this line or any other -- it
+        # used to auto-lock the whole axis based on whether the text
+        # looked like a fraction ('/') or had a decimal point, which meant
+        # Settings > Default Display Mode silently stopped doing anything
+        # the moment any line on that axis had ever been typed with a '.',
+        # i.e. almost immediately for most real measurements. Display mode
+        # is controlled by exactly two things now: Settings > Default
+        # Display Mode (applies live, everywhere, to every line with no
+        # override), and the Display section's mode dropdown for a
+        # specific line (an explicit, visible override) -- nothing hidden
+        # in between.
+        ln.unit = new_unit
         if changed:
             self.mark_dirty()
         self.redraw()
@@ -1724,6 +1820,7 @@ class ProjectTab(ttk.Frame):
     def delete_selected(self):
         if not self.selected_line_ids:
             return
+        self._push_undo()
         self.lines = [ln for ln in self.lines if ln.id not in self.selected_line_ids]
         self.selected_line_ids = []
         self.mark_dirty()
@@ -1942,6 +2039,9 @@ class App:
         self.root.bind("<Control-s>", lambda e: self._dispatch("save_project"))
         self.root.bind("<Control-t>", lambda e: self.new_tab())
         self.root.bind("<Control-w>", lambda e: self.close_active_tab())
+        self.root.bind("<Control-z>", lambda e: self._dispatch("undo"))
+        self.root.bind("<Control-y>", lambda e: self._dispatch("redo"))
+        self.root.bind("<Control-Shift-Z>", lambda e: self._dispatch("redo"))
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
@@ -1971,6 +2071,11 @@ class App:
         menubar.add_cascade(label="File", menu=filemenu)
 
         editmenu = tk.Menu(menubar, tearoff=0)
+        editmenu.add_command(label="Undo", accelerator="Ctrl+Z",
+                              command=lambda: self._dispatch("undo"))
+        editmenu.add_command(label="Redo", accelerator="Ctrl+Y",
+                              command=lambda: self._dispatch("redo"))
+        editmenu.add_separator()
         editmenu.add_command(label="Delete Selected Line(s)",
                               command=lambda: self._dispatch("delete_selected"))
         editmenu.add_command(label="Edit Known Length",
@@ -2170,11 +2275,16 @@ class App:
             "or the side list in any combination. Esc cancels.\n"
             "9. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "10. Save Project keeps one tab's image (a full copy, not just its "
+            "10. Ctrl+Z undoes and Ctrl+Y (or Ctrl+Shift+Z) redoes -- drawing a "
+            "line, deleting line(s), dragging an endpoint, Make Parallel, a "
+            "known-length or Display-section change, and Rotate 90° all step "
+            "back one action at a time. Opening a different image or project "
+            "starts that tab's undo history fresh.\n"
+            "11. Save Project keeps one tab's image (a full copy, not just its "
             "path), rotation, and lines in a single .imt file you can reopen "
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
-            "11. The whole window -- every open tab, saved or not -- is "
+            "12. The whole window -- every open tab, saved or not -- is "
             "remembered automatically and restored next time you launch the app."
         ))
 

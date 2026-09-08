@@ -207,6 +207,13 @@ If you want a project to survive on its own regardless, use Save Project.
   exactly onto that vertex, so segments measuring different axes can share
   a precise corner (e.g. a red X-edge and a green Y-edge meeting at the same
   pixel).
+- **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
+  drawing a line, deleting line(s), dragging an endpoint (one step per drag,
+  not per pixel it moved), Make Parallel, a known-length or Display-section
+  change, and Rotate 90° -- one step per action, in order, same as any other
+  editor. Ctrl+Y redoes; doing anything new after an undo drops whatever was
+  available to redo, same as everywhere else. Opening a different image (or
+  a project) into a tab starts that tab's undo history fresh.
 - **Save Project / Open Project** stores the image path, a copy of the image
   itself, rotation, and every line (color, endpoints, known length, unit) in
   a single `.imt` file so you can pick up where you left off -- even from
