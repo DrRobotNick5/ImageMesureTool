@@ -188,6 +188,18 @@ If you want a project to survive on its own regardless, use Save Project.
   reference is always shown next to the toolbar buttons. Useful for
   measuring opposite edges of an object (e.g. both long sides of a box)
   even if your drag isn't pixel-perfect.
+- **Make Parallel** (toolbar button, Edit menu, or just press **P**): turns
+  a line you *already drew* to make it run parallel to another one, instead
+  of only helping while drawing a brand-new one. Its length doesn't change
+  -- only its direction -- pivoting around its own first point, so if that
+  point happens to be one you snapped onto another line's vertex, that
+  connection stays put. If you already have exactly one line selected when
+  you activate it, that line becomes the reference immediately and it asks
+  you to click the line that should become parallel to it; otherwise it
+  asks for the reference first, then the one to change -- either way, pick
+  both by clicking on the photo or by clicking a row in the side list, in
+  any combination. Esc cancels at any point, and pressing **P** (or the
+  button) again while it's active cancels it too.
 - **Editing endpoints**: hover over the end of a line drawn in the *current*
   color and the cursor turns into a move icon -- drag it to reposition that
   point. Hover over the end of a line in a *different* color and the cursor

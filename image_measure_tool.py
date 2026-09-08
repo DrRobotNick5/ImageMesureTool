@@ -456,6 +456,13 @@ class ProjectTab(ttk.Frame):
         self.press_canvas = None          # (x, y) where the current press started
         self.press_moved = False          # did the mouse move past the click threshold?
         self.click_draw_start = None      # (ix, iy) start of a click-to-click pending line
+        # "Make Parallel" tool state -- see start_make_parallel/_maybe_advance_parallel_pick.
+        # None while inactive; "first" while waiting to pick the reference
+        # line; "second" while waiting to pick the line that gets rotated
+        # to match it. parallel_first_id holds the reference line's id
+        # once chosen, only meaningful while parallel_picking == "second".
+        self.parallel_picking = None
+        self.parallel_first_id = None
         self.known_length_edit_snapshot = None  # (length_str, unit_str) before the current
                                                   # known-length edit, for Escape to revert to
         self._suppress_next_focus_snapshot = False  # see maybe_start_length_edit /
@@ -1008,8 +1015,125 @@ class ProjectTab(ttk.Frame):
         proj_len = vx * dirx + vy * diry
         return ix1 + proj_len * dirx, iy1 + proj_len * diry
 
+    # --------------------------------------------------- make-parallel tool
+    def start_make_parallel(self):
+        """Toolbar button / 'P': turn an existing (already-drawn) second
+        line parallel to a first one, picked by clicking either on the
+        canvas or in the side list. If exactly one line is already
+        selected when this starts, it's taken as the reference line
+        immediately and picking begins on the second one; otherwise the
+        first click picks the reference. Esc (or pressing the button/'P'
+        again) cancels at any point."""
+        if not self.pil_image:
+            self.app.set_status("Open an image first.")
+            return
+        if len(self.lines) < 2:
+            self.app.set_status("Need at least two lines to make one parallel to another.")
+            return
+        self.cancel_click_draw()
+        self.parallel_picking = "first"
+        self.parallel_first_id = None
+        self.app.set_status(
+            "Make Parallel: click the REFERENCE line (canvas or list). Esc to cancel.")
+        self.app.refresh_toolbar_hint(self)
+        # If a single line was already selected, this immediately promotes
+        # it to the reference and moves straight to picking the second
+        # line -- see _maybe_advance_parallel_pick.
+        self._maybe_advance_parallel_pick()
+
+    def toggle_make_parallel(self):
+        if self.parallel_picking:
+            self.cancel_make_parallel()
+        else:
+            self.start_make_parallel()
+
+    def cancel_make_parallel(self):
+        if not self.parallel_picking:
+            return
+        self.parallel_picking = None
+        self.parallel_first_id = None
+        self.app.set_status("Make Parallel cancelled.")
+        self.app.refresh_toolbar_hint(self)
+
+    def _maybe_advance_parallel_pick(self):
+        """Called after every selection change (canvas click or side-list
+        click both funnel through select_line/on_tree_select) while the
+        Make Parallel tool is active. A single freshly-selected line
+        advances the tool to its next step; anything else (nothing
+        selected, or a multi-select) just leaves it waiting."""
+        if not self.parallel_picking:
+            return
+        if len(self.selected_line_ids) != 1:
+            return
+        picked_id = self.selected_line_ids[0]
+        if self.parallel_picking == "first":
+            self.parallel_first_id = picked_id
+            self.parallel_picking = "second"
+            ln = self._line_by_id(picked_id)
+            self.app.set_status(
+                f"Make Parallel: line #{ln.id} ({ln.color}) is the reference -- "
+                "now click the line to make parallel to it (canvas or list). "
+                "Esc to cancel.")
+            self.app.refresh_toolbar_hint(self)
+            return
+        if picked_id == self.parallel_first_id:
+            self.app.set_status(
+                "Make Parallel: pick a different line than the reference. Esc to cancel.")
+            return
+        ref_id = self.parallel_first_id
+        self.parallel_picking = None
+        self.parallel_first_id = None
+        self.app.refresh_toolbar_hint(self)
+        self._apply_parallel(ref_id, picked_id)
+
+    def _apply_parallel(self, ref_id, target_id):
+        """Rotate the target line around its OWN first endpoint (x1, y1
+        stays fixed) so it runs in the same direction as the reference
+        line, keeping the target's own pixel length exactly as it was --
+        this only changes direction, never length or the calibration/known
+        length either line already has. Whichever of the two directions
+        along that line (ref's angle, or its exact opposite) is closer to
+        the target's current direction is used, so the line pivots into
+        place rather than unexpectedly flipping end-for-end."""
+        ref = self._line_by_id(ref_id)
+        target = self._line_by_id(target_id)
+        if not ref or not target:
+            return
+        length = target.pixel_length()
+        if length <= 0:
+            return
+        ref_ang = ref.angle()
+        cur_ang = target.angle()
+
+        def ang_diff(a, b):
+            return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+        use_ang = ref_ang if ang_diff(ref_ang, cur_ang) <= ang_diff(ref_ang + math.pi, cur_ang) \
+            else ref_ang + math.pi
+        target.x2 = target.x1 + length * math.cos(use_ang)
+        target.y2 = target.y1 + length * math.sin(use_ang)
+        target.parallel_to = ref.id
+        self.mark_dirty()
+        self.select_line(target.id)
+        self.app.set_status(
+            f"Line #{target.id} ({target.color}) is now parallel to "
+            f"line #{ref.id} ({ref.color}).")
+
     def on_canvas_press(self, event):
         if not self.pil_image:
+            return
+
+        # "Make Parallel" is picking a line right now -- every click, in
+        # EITHER Draw or Select mode, just picks whichever line is under
+        # the cursor (or does nothing on a miss, staying in picking mode)
+        # instead of drawing or doing anything else. See
+        # start_make_parallel / _maybe_advance_parallel_pick.
+        if self.parallel_picking:
+            ix, iy = self.canvas_event_to_img(event)
+            tol_img = HIT_TOLERANCE / self.scale
+            ln = self.find_line_near(ix, iy, tol_img)
+            if ln:
+                self.select_line(ln.id)
             return
 
         # A line started by a short click is waiting for its closing click --
@@ -1316,13 +1440,17 @@ class ProjectTab(ttk.Frame):
 
     def on_escape_key(self):
         """Escape either reverts an in-progress known-length edit back to
-        its pre-edit value (if that field has focus), or -- otherwise --
-        cancels a line that was started with a short click and is waiting
-        for its closing click."""
+        its pre-edit value (if that field has focus), cancels an in-
+        progress Make Parallel pick, or -- otherwise -- cancels a line
+        that was started with a short click and is waiting for its
+        closing click."""
         focused = self.app.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
             self.cancel_length_edit()
             self.canvas.focus_set()
+            return
+        if self.parallel_picking:
+            self.cancel_make_parallel()
             return
         self.cancel_click_draw()
 
@@ -1403,6 +1531,7 @@ class ProjectTab(ttk.Frame):
             self.selected_line_ids = [line_id]
         self.redraw()
         self.populate_known_length_field()
+        self._maybe_advance_parallel_pick()
 
     def on_tree_select(self, event=None):
         sel = [int(i) for i in self.tree.selection()]
@@ -1417,6 +1546,7 @@ class ProjectTab(ttk.Frame):
         self.selected_line_ids = sel
         self.redraw()
         self.populate_known_length_field()
+        self._maybe_advance_parallel_pick()
 
     # ------------------------------------------------- known-length field
     def _update_denom_row_visibility(self, ln):
@@ -1800,6 +1930,8 @@ class App:
 
         self.root.bind("<Delete>", self._delete_selected_shortcut)
         self.root.bind("<BackSpace>", self._delete_selected_shortcut)
+        self.root.bind("<p>", self._make_parallel_shortcut)
+        self.root.bind("<P>", self._make_parallel_shortcut)
         self.root.bind("<Tab>", self._on_tab_key)
         self.root.bind("<Shift-Tab>", lambda e: self._on_tab_key(e, direction=-1))
         # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
@@ -1845,6 +1977,8 @@ class App:
                               command=lambda: self._dispatch("focus_known_length"))
         editmenu.add_command(label="Compare Selected Two Lines...",
                               command=lambda: self._dispatch("compare_selected"))
+        editmenu.add_command(label="Make Parallel...", accelerator="P",
+                              command=lambda: self._dispatch("toggle_make_parallel"))
         editmenu.add_separator()
         editmenu.add_command(label="Rotate Image 90°", command=lambda: self._dispatch("rotate_image"))
         menubar.add_cascade(label="Edit", menu=editmenu)
@@ -1952,6 +2086,10 @@ class App:
         ttk.Button(bar, text="Zoom Out", command=lambda: self._dispatch("zoom", 0.8)).pack(side="left", padx=2)
         ttk.Button(bar, text="Fit", command=lambda: self._dispatch("fit_to_window")).pack(side="left", padx=2)
         ttk.Button(bar, text="Rotate 90°", command=lambda: self._dispatch("rotate_image")).pack(side="left", padx=2)
+        self.parallel_button = ttk.Button(
+            bar, text="Make Parallel (P)",
+            command=lambda: self._dispatch("toggle_make_parallel"))
+        self.parallel_button.pack(side="left", padx=2)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
@@ -2025,13 +2163,18 @@ class App:
             "a whole axis.\n"
             "7. Hold Shift while drawing a new line to lock its direction "
             "parallel to the selected line (or the last line drawn).\n"
-            "8. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
+            "8. 'Make Parallel' (toolbar button, Edit menu, or press P) does the "
+            "same thing to a line you already drew, instead of only while "
+            "drawing a new one -- pick a reference line, then the line to "
+            "rotate to match it (its length doesn't change), using the photo "
+            "or the side list in any combination. Esc cancels.\n"
+            "9. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "9. Save Project keeps one tab's image (a full copy, not just its "
+            "10. Save Project keeps one tab's image (a full copy, not just its "
             "path), rotation, and lines in a single .imt file you can reopen "
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
-            "10. The whole window -- every open tab, saved or not -- is "
+            "11. The whole window -- every open tab, saved or not -- is "
             "remembered automatically and restored next time you launch the app."
         ))
 
@@ -2142,6 +2285,21 @@ class App:
         tab.delete_selected()
         return None
 
+    def _make_parallel_shortcut(self, event=None):
+        """'P' toggles the Make Parallel tool -- but not while typing/
+        picking in the known-length field or any of the Display combos,
+        where 'p' obviously means the letter (e.g. typing into a unit box
+        that has 'px' as a choice), not the shortcut."""
+        tab = self.active_tab()
+        if tab is None:
+            return None
+        guarded = (tab.known_length_entry, tab.known_unit_box, tab.display_mode_box,
+                   tab.display_unit_box, tab.display_denominator_box)
+        if self.root.focus_get() in guarded:
+            return None
+        tab.toggle_make_parallel()
+        return "break"
+
     def _dispatch(self, method_name, *args):
         tab = self.active_tab()
         if tab is None:
@@ -2162,6 +2320,18 @@ class App:
     def refresh_toolbar_hint(self, tab):
         if tab is not self.active_tab():
             return
+        if tab.parallel_picking:
+            self.parallel_button.config(text="Cancel Parallel (Esc)")
+            if tab.parallel_picking == "first":
+                self.parallel_hint.config(
+                    text="Make Parallel: click the REFERENCE line (canvas or list)")
+            else:
+                ln = tab._line_by_id(tab.parallel_first_id)
+                ref_label = f"#{ln.id} ({ln.color})" if ln else "?"
+                self.parallel_hint.config(
+                    text=f"Make Parallel: click the line to make parallel to {ref_label}")
+            return
+        self.parallel_button.config(text="Make Parallel (P)")
         ref = tab._parallel_reference()
         if ref:
             self.parallel_hint.config(
