@@ -82,6 +82,22 @@ AXIS_COLORS = {
     "blue": {"axis": "Z", "hex": "#1e88e5", "select_hex": "#82b1ff"},
 }
 DEFAULT_COLOR = "red"
+# Orange is a 4th line color, but NOT a 4th measurement axis -- it's never
+# in AXIS_COLORS (so it never appears in the Red/Green/Blue draw-color
+# picker or the Tab-cycles-color rotation) and never a target for known-
+# length axis calibration on its own. It marks a Circle's 2 diameter
+# lines for as long as they're not yet assigned to a real axis -- see
+# Ellipse / ProjectTab.assign_diameter_axis.
+ORANGE_COLOR = "orange"
+ORANGE_META = {"axis": None, "hex": "#fb8c00", "select_hex": "#ffcc80"}
+
+
+def line_color_meta(color):
+    """AXIS_COLORS[color], plus Orange (which isn't a measurement axis, so
+    it's deliberately not in that dict) -- use this instead of indexing
+    AXIS_COLORS directly anywhere a Line's *own* .color is being looked up,
+    since an ellipse's diameter lines can be orange."""
+    return AXIS_COLORS.get(color, ORANGE_META)
 UNIT_CHOICES = ["mm", "cm", "m", "in", "ft", "px"]
 DEFAULT_UNIT = "mm"
 # Millimeters per unit, for converting a computed length into a DIFFERENT
@@ -170,6 +186,115 @@ def convert_length(value, from_unit, to_unit):
     if from_unit not in UNIT_TO_MM or to_unit not in UNIT_TO_MM:
         return None
     return value * UNIT_TO_MM[from_unit] / UNIT_TO_MM[to_unit]
+
+
+# --------------------------------------------------------- ellipse math ----
+# A circle photographed at an angle projects to an ellipse. This app defines
+# one from 2 "diameter" lines through a shared center -- each line's own
+# vector from that center (u for one line, v for the other) is used as a
+# CONJUGATE SEMI-DIAMETER PAIR: the ellipse is exactly the curve
+#     P(t) = center + cos(t)*u + sin(t)*v ,  t in [0, 2*pi)
+# This is well-defined for any 2 non-parallel u, v (u sits at t=0, v at
+# t=pi/2, by construction) and is the same classical technique used to draw
+# a circle in perspective/isometric views by hand. Two points on an ellipse
+# are only USABLE this way (reproducing the intended curve) when they're a
+# true conjugate pair, which is why "rotating" one diameter afterward can't
+# just move it to a new spot and re-derive the shape from scratch -- see
+# ellipse_canonical / ellipse_param_for_direction below, which instead work
+# from the frozen canonical (semi_a, semi_b, phi) form so the curve itself
+# never changes shape mid-rotate.
+def ellipse_canonical(cx, cy, ux, uy, vx, vy):
+    """Convert a center + 2 conjugate semi-diameter vectors (u, v) into the
+    ellipse's canonical form: semi_a >= semi_b (the semi-major/minor axis
+    lengths) and phi (the semi-major axis's direction, radians). Same
+    curve, just re-expressed in an orthogonal basis -- needed so a later
+    "rotate" can address any point on the boundary by a true geometric
+    angle instead of only the 2 original conjugate directions."""
+    P = ux * ux + uy * uy
+    Q = vx * vx + vy * vy
+    R = ux * vx + uy * vy
+    if abs(P - Q) < 1e-12 and abs(R) < 1e-12:
+        t0 = 0.0
+    else:
+        t0 = 0.5 * math.atan2(2 * R, P - Q)
+
+    def point_at(t):
+        return (ux * math.cos(t) + vx * math.sin(t), uy * math.cos(t) + vy * math.sin(t))
+
+    p1 = point_at(t0)
+    p2 = point_at(t0 + math.pi / 2)
+    len1, len2 = math.hypot(*p1), math.hypot(*p2)
+    if len1 >= len2:
+        return len1, len2, math.atan2(p1[1], p1[0])
+    return len2, len1, math.atan2(p2[1], p2[0])
+
+
+def ellipse_point_at(cx, cy, semi_a, semi_b, phi, t):
+    """The boundary point at canonical parameter t (radians)."""
+    ca, sa = math.cos(phi), math.sin(phi)
+    ct, st = math.cos(t), math.sin(t)
+    return (cx + semi_a * ct * ca - semi_b * st * sa,
+            cy + semi_a * ct * sa + semi_b * st * ca)
+
+
+def ellipse_param_of_point(cx, cy, semi_a, semi_b, phi, px, py):
+    """The canonical parameter t of a point already known to be on the
+    ellipse (e.g. one of its diameter endpoints) -- the inverse of
+    ellipse_point_at."""
+    dx, dy = px - cx, py - cy
+    ca, sa = math.cos(phi), math.sin(phi)
+    rx = dx * ca + dy * sa
+    ry = -dx * sa + dy * ca
+    cos_t = rx / semi_a if semi_a > 1e-9 else 0.0
+    sin_t = ry / semi_b if semi_b > 1e-9 else 0.0
+    return math.atan2(sin_t, cos_t)
+
+
+def ellipse_param_for_direction(cx, cy, semi_a, semi_b, phi, dx, dy):
+    """The parameter t whose boundary point lies in the direction (dx, dy)
+    as seen from the center (the antipodal solution, on the opposite side,
+    is t +/- pi -- this picks the one actually pointing that way). Used
+    both for a diameter following the cursor (dx,dy = cursor - center) and
+    for aligning it to a reference line's direction (Make Parallel)."""
+    ca, sa = math.cos(phi), math.sin(phi)
+    rx = dx * ca + dy * sa
+    ry = -dx * sa + dy * ca
+    t = math.atan2(semi_a * ry, semi_b * rx)
+    px, py = ellipse_point_at(cx, cy, semi_a, semi_b, phi, t)
+    if (px - cx) * dx + (py - cy) * dy < 0:
+        t += math.pi
+    return t
+
+
+def ellipse_nearest_point(cx, cy, semi_a, semi_b, phi, px, py, samples=72):
+    """The closest point on the ellipse boundary to (px, py), for Snap
+    Mode. A coarse sample around the whole boundary followed by a short
+    ternary-search refinement -- simple and numerically robust (no
+    divergence risk) rather than a closed-form root solve, which is more
+    than accurate enough for a several-pixel hit-test tolerance."""
+    best_t, best_d2 = 0.0, None
+    for i in range(samples):
+        t = 2 * math.pi * i / samples
+        x, y = ellipse_point_at(cx, cy, semi_a, semi_b, phi, t)
+        d2 = (x - px) ** 2 + (y - py) ** 2
+        if best_d2 is None or d2 < best_d2:
+            best_d2, best_t = d2, t
+    step = 2 * math.pi / samples
+    lo, hi = best_t - step, best_t + step
+
+    def d2_at(t):
+        x, y = ellipse_point_at(cx, cy, semi_a, semi_b, phi, t)
+        return (x - px) ** 2 + (y - py) ** 2
+
+    for _ in range(20):
+        m1 = lo + (hi - lo) / 3
+        m2 = hi - (hi - lo) / 3
+        if d2_at(m1) < d2_at(m2):
+            hi = m2
+        else:
+            lo = m1
+    t = (lo + hi) / 2
+    return ellipse_point_at(cx, cy, semi_a, semi_b, phi, t)
 
 
 # ------------------------------------------------------- fraction input ----
@@ -326,6 +451,100 @@ class Line:
         return ln
 
 
+class Ellipse:
+    """A circle-in-perspective, defined by its center plus 2 conjugate
+    diameters (each stored as a Line whose 2 endpoints are always kept
+    exactly opposite the center -- see ProjectTab.mirror_diameter_endpoint).
+    line_a_id/line_b_id point at those 2 Lines by id; the Lines themselves
+    carry the color (orange until axis-assigned) and are what render, get
+    selected, deleted, etc. -- Ellipse itself only tracks the shared center,
+    the circle's own known radius/diameter (if the user gave one), and its
+    CURRENT SHAPE.
+
+    The shape (semi_a, semi_b, phi -- see ellipse_canonical) is stored here,
+    not re-derived live from the 2 lines on every call. That distinction
+    matters: RESHAPING (freely moving one diameter's endpoint) genuinely
+    redefines the shape, so it calls recompute_shape() to re-derive and
+    store a fresh one from the 2 lines' new positions. But ROTATING (see
+    ProjectTab.rotating_diameter) is specifically about sliding a point
+    along an ALREADY-FIXED shape without changing it -- and after an
+    independent rotate, the 2 diameter lines are no longer necessarily a
+    "conjugate pair" 90 degrees apart in this shape's own parameter space
+    (e.g. line A rotated to align with one axis, line B left alone or
+    aligned to a different axis), so re-deriving the shape live from
+    (line_a, line_b) at that point would produce a DIFFERENT ellipse than
+    the one actually being shown -- see the design note above
+    ellipse_canonical for why only a true conjugate pair reproduces a
+    given shape via the P(t) formula. Keeping the shape as its own stored
+    field, updated only on reshape/creation (never on rotate or a whole-
+    ellipse translate, which don't change it), is what makes "rotate one
+    diameter without disturbing the other, or the circle's boundary"
+    actually hold.
+
+    known_value/known_is_diameter/known_unit describe a real-world size for
+    the CIRCLE (not yet tied to any axis) -- see ProjectTab.assign_diameter_axis,
+    which is what turns this into a known_length on whichever diameter Line
+    gets assigned to a real (red/green/blue) axis.
+    """
+
+    _next_id = 1
+
+    def __init__(self, cx, cy, line_a_id, line_b_id, known_value=None,
+                 known_is_diameter=True, known_unit=None,
+                 semi_a=0.0, semi_b=0.0, phi=0.0):
+        self.id = Ellipse._next_id
+        Ellipse._next_id += 1
+        self.cx, self.cy = cx, cy
+        self.line_a_id = line_a_id
+        self.line_b_id = line_b_id
+        self.known_value = known_value        # radius or diameter, or None
+        self.known_is_diameter = known_is_diameter
+        self.known_unit = known_unit
+        self.semi_a, self.semi_b, self.phi = semi_a, semi_b, phi
+
+    def to_dict(self):
+        return {
+            "id": self.id, "cx": self.cx, "cy": self.cy,
+            "line_a_id": self.line_a_id, "line_b_id": self.line_b_id,
+            "known_value": self.known_value,
+            "known_is_diameter": self.known_is_diameter,
+            "known_unit": self.known_unit,
+            "semi_a": self.semi_a, "semi_b": self.semi_b, "phi": self.phi,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        el = cls(d["cx"], d["cy"], d["line_a_id"], d["line_b_id"],
+                  d.get("known_value"), d.get("known_is_diameter", True),
+                  d.get("known_unit"), d.get("semi_a", 0.0), d.get("semi_b", 0.0),
+                  d.get("phi", 0.0))
+        el.id = d["id"]
+        Ellipse._next_id = max(Ellipse._next_id, el.id + 1)
+        return el
+
+    def canonical(self, tab=None):
+        """(semi_a, semi_b, phi) -- this ellipse's current, STORED shape
+        (see the class docstring for why it's stored rather than
+        re-derived live). `tab` is accepted but unused, kept only so
+        existing call sites (`ellipse.canonical(self)`) don't all need
+        updating."""
+        return self.semi_a, self.semi_b, self.phi
+
+    def recompute_shape(self, tab):
+        """Re-derive the shape from the 2 diameter lines' CURRENT
+        positions and store it -- call this after a RESHAPE (a diameter
+        endpoint moved freely, not via rotate), including right after the
+        Circle tool creates a new one. Never call this after a rotate or a
+        whole-ellipse translate; neither actually changes the shape, and
+        re-deriving it from lines that are no longer a true conjugate pair
+        (see the class docstring) would silently corrupt it."""
+        a = tab._line_by_id(self.line_a_id)
+        b = tab._line_by_id(self.line_b_id)
+        ux, uy = a.x2 - self.cx, a.y2 - self.cy
+        vx, vy = b.x2 - self.cx, b.y2 - self.cy
+        self.semi_a, self.semi_b, self.phi = ellipse_canonical(self.cx, self.cy, ux, uy, vx, vy)
+
+
 # ---------------------------------------------------------------- tabs -----
 class ClosableNotebook(ttk.Notebook):
     """A ttk.Notebook whose tabs each draw a small 'x' close button.
@@ -451,9 +670,11 @@ class ProjectTab(ttk.Frame):
 
         self.pan_start = None             # (canvas_x, canvas_y, view_x, view_y) mid-drag
         self.lines = []                   # list[Line]
+        self.ellipses = []                # list[Ellipse] -- circles-in-perspective
         self.selected_line_ids = []       # for compare / delete / calibrate
         self.drag_start_img = None        # (ix, iy) anchor for a hold-and-drag line
         self.drag_temp_id = None          # canvas id of the dashed preview line
+        self._circle_preview_ids = []     # canvas ids of the Circle tool's dashed preview
         self.dragging_vertex = None        # (Line, endpoint_index) while moving a vertex
         self.moving_line = None           # (Line, orig_x1, orig_y1, orig_x2, orig_y2,
                                             # anchor_ix, anchor_iy) while Shift-dragging a
@@ -483,6 +704,27 @@ class ProjectTab(ttk.Frame):
         # once chosen, only meaningful while parallel_picking == "second".
         self.parallel_picking = None
         self.parallel_first_id = None
+        # Circle draw tool -- see on_canvas_press's circle-mode handling.
+        # None while inactive; while active, a list of the
+        # image-space points clicked so far this circle (0, 1, or 2 of them --
+        # a 3rd click finishes it): [] just after entering Circle mode/undoing
+        # a click, [(cx,cy)] after the center click, [(cx,cy),(ax,ay)] after
+        # the first circumference point.
+        self.circle_points = None
+        # Rotate a diameter line within its ellipse's already-fixed boundary
+        # (Ctrl+Shift+drag on one of its endpoints) -- see
+        # ellipse_param_for_direction. (ellipse, line, endpoint_index,
+        # semi_a, semi_b, phi) frozen at the start of the gesture, so the
+        # shape itself never changes mid-rotate, only where along it the
+        # point sits.
+        self.rotating_diameter = None
+        # Translate a whole ellipse (Shift-drag on its curve, or on the BODY
+        # -- not an endpoint -- of one of its diameter lines): (ellipse,
+        # orig_cx, orig_cy, orig_a_coords, orig_b_coords, anchor_ix, anchor_iy).
+        # orig_a_coords/orig_b_coords are each (x1,y1,x2,y2) as of gesture
+        # start; every point (center + both lines' 4 endpoints) shifts by
+        # the same delta, so the ellipse's shape/orientation never changes.
+        self.moving_ellipse = None
         # Undo/redo -- see _push_undo/_restore_snapshot/undo/redo. Each
         # entry is a full snapshot of everything an action here can
         # change: the line list, rotation, and (for rotate specifically)
@@ -615,6 +857,61 @@ class ProjectTab(ttk.Frame):
         self.display_denominator_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
         self._denom_row_visible = True
 
+        # --- Circle panel: only meaningful when the selected line is one of
+        # a Circle's 2 diameter lines. Axis assignment moves it out of
+        # orange (unassigned) onto a real measurement axis, which is what
+        # turns the circle's own known radius/diameter (below) into that
+        # line's actual known_length -- see assign_diameter_axis. The
+        # known radius/diameter itself belongs to the CIRCLE, not to either
+        # line individually, so it's set once here and propagates to
+        # whichever line(s) are already axis-assigned -- see
+        # commit_circle_known_value.
+        circle_frame = ttk.LabelFrame(side, text="Circle (selected diameter line)", padding=6)
+        circle_frame.pack(fill="x", pady=(0, 8))
+        self.circle_selection_label = ttk.Label(
+            circle_frame, text="No circle line selected", foreground="#555")
+        self.circle_selection_label.pack(anchor="w")
+
+        axis_assign_row = ttk.Frame(circle_frame)
+        axis_assign_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(axis_assign_row, text="Axis:").pack(side="left")
+        self.circle_axis_var = tk.StringVar(value=ORANGE_COLOR)
+        self.circle_axis_buttons = {}
+        for color in (ORANGE_COLOR,) + tuple(AXIS_COLORS.keys()):
+            meta = line_color_meta(color)
+            label = "none (orange)" if color == ORANGE_COLOR else f"{meta['axis']} ({color})"
+            btn = tk.Radiobutton(
+                axis_assign_row, text=label, variable=self.circle_axis_var, value=color,
+                indicatoron=False, fg="white", bg=meta["hex"], selectcolor=meta["hex"],
+                activebackground=meta["select_hex"], state="disabled",
+                command=self.commit_circle_axis)
+            btn.pack(side="left", padx=2)
+            self.circle_axis_buttons[color] = btn
+
+        known_circle_row = ttk.Frame(circle_frame)
+        known_circle_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(known_circle_row, text="Known:").pack(side="left")
+        self.circle_known_var = tk.StringVar(value="")
+        self.circle_known_entry = ttk.Entry(
+            known_circle_row, textvariable=self.circle_known_var, width=10, state="disabled")
+        self.circle_known_entry.pack(side="left", padx=(4, 0))
+        self.circle_known_entry.bind("<Return>", self.commit_circle_known_value)
+        self.circle_known_entry.bind("<FocusOut>", self.commit_circle_known_value)
+
+        self.circle_known_unit_var = tk.StringVar(value=DEFAULT_UNIT)
+        self.circle_known_unit_box = ttk.Combobox(
+            known_circle_row, textvariable=self.circle_known_unit_var, width=6,
+            state="disabled", values=UNIT_CHOICES)
+        self.circle_known_unit_box.pack(side="left", padx=(4, 0))
+        self.circle_known_unit_box.bind("<<ComboboxSelected>>", self.commit_circle_known_value)
+
+        self.circle_known_is_diameter_var = tk.StringVar(value="diameter")
+        self.circle_known_kind_box = ttk.Combobox(
+            known_circle_row, textvariable=self.circle_known_is_diameter_var, width=9,
+            state="disabled", values=["diameter", "radius"])
+        self.circle_known_kind_box.pack(side="left", padx=(4, 0))
+        self.circle_known_kind_box.bind("<<ComboboxSelected>>", self.commit_circle_known_value)
+
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
         columns = ("color", "axis", "px", "real", "calib")
         self.tree = ttk.Treeview(side, columns=columns, show="headings", height=20,
@@ -724,7 +1021,11 @@ class ProjectTab(ttk.Frame):
         self.drag_start_img = None
         self.drag_temp_id = None
         self.click_draw_start = None
+        self.circle_points = None
+        self.rotating_diameter = None
+        self.moving_ellipse = None
         self.lines = []
+        self.ellipses = []
         self.selected_line_ids = []
         self.project_path = None
         self.dirty = False
@@ -958,9 +1259,15 @@ class ProjectTab(ttk.Frame):
         """Real-world length for a line: its own known length if set,
         otherwise derived from its axis's calibration. Always in whichever
         unit that calibration used -- see effective_display for a line's
-        own display unit/mode (which may differ)."""
+        own display unit/mode (which may differ). Orange (an ellipse
+        diameter not yet assigned to a real axis) never borrows calibration
+        from another orange line -- orange isn't a measurement axis, it's
+        just "no axis yet", so two unrelated circles' unassigned diameters
+        must never cross-calibrate each other just for sharing that color."""
         if line.known_length:
             return line.known_length, line.unit
+        if line.color == ORANGE_COLOR:
+            return None, None
         upp, unit = self.axis_scale(line.color)
         if upp is None:
             return None, None
@@ -1058,12 +1365,29 @@ class ProjectTab(ttk.Frame):
                 d = dist((ix, iy), (vx, vy))
                 if d <= best_d:
                     best_pt, best_d = (vx, vy), d
+        # A circle's CENTER is as meaningful a point as any line's vertex
+        # (e.g. snapping a new line's end to the exact center of a circle),
+        # so it's checked in this same top-priority tier.
+        for el in self.ellipses:
+            d = dist((ix, iy), (el.cx, el.cy))
+            if d <= best_d:
+                best_pt, best_d = (el.cx, el.cy), d
         if best_pt is not None:
             return best_pt
         for ln in self.lines:
             if ln.id in exclude_ids:
                 continue
             proj = self._nearest_point_on_segment((ix, iy), (ln.x1, ln.y1), (ln.x2, ln.y2))
+            d = dist((ix, iy), proj)
+            if d <= best_d:
+                best_pt, best_d = proj, d
+        # A circle's EDGE (its curve, not its 2 straight diameter lines,
+        # which the loop above already covers) is the same tier as
+        # snapping onto a line's body -- neither is as strong a match as an
+        # exact vertex/center, but either is still worth pulling onto.
+        for el in self.ellipses:
+            semi_a, semi_b, phi = el.canonical(self)
+            proj = ellipse_nearest_point(el.cx, el.cy, semi_a, semi_b, phi, ix, iy)
             d = dist((ix, iy), proj)
             if d <= best_d:
                 best_pt, best_d = proj, d
@@ -1206,9 +1530,26 @@ class ProjectTab(ttk.Frame):
 
         use_ang = ref_ang if ang_diff(ref_ang, cur_ang) <= ang_diff(ref_ang + math.pi, cur_ang) \
             else ref_ang + math.pi
-        self._push_undo()
-        target.x2 = target.x1 + length * math.cos(use_ang)
-        target.y2 = target.y1 + length * math.sin(use_ang)
+
+        ellipse = self.ellipse_for_line(target.id)
+        if ellipse:
+            # A Circle diameter line can't just pivot around one endpoint
+            # like an ordinary line (that would leave it off its own
+            # circle) -- instead it ROTATES within its already-fixed
+            # ellipse boundary to the nearest point in the reference's
+            # direction, same mechanism as a manual rotate (Ctrl+Shift-
+            # drag) -- see rotating_diameter / ellipse_param_for_direction.
+            semi_a, semi_b, phi = ellipse.canonical(self)
+            dx, dy = math.cos(use_ang), math.sin(use_ang)
+            t = ellipse_param_for_direction(ellipse.cx, ellipse.cy, semi_a, semi_b, phi, dx, dy)
+            px, py = ellipse_point_at(ellipse.cx, ellipse.cy, semi_a, semi_b, phi, t)
+            self._push_undo()
+            target.x2, target.y2 = px, py
+            self.mirror_diameter_endpoint(ellipse, target, 2)
+        else:
+            self._push_undo()
+            target.x2 = target.x1 + length * math.cos(use_ang)
+            target.y2 = target.y1 + length * math.sin(use_ang)
         target.parallel_to = ref.id
         self.mark_dirty()
         self.select_line(target.id)
@@ -1227,6 +1568,7 @@ class ProjectTab(ttk.Frame):
         `lines` that costs anything, and line lists are small)."""
         return {
             "lines": copy.deepcopy(self.lines),
+            "ellipses": copy.deepcopy(self.ellipses),
             "rotation_turns": self.rotation_turns,
             "pil_image": self.pil_image,
             "pyramid": self.pyramid,
@@ -1252,6 +1594,7 @@ class ProjectTab(ttk.Frame):
         # background image).
         image_changed = snap["pil_image"] is not self.pil_image
         self.lines = snap["lines"]
+        self.ellipses = snap["ellipses"]
         self.rotation_turns = snap["rotation_turns"]
         self.pil_image = snap["pil_image"]
         self.pyramid = snap["pyramid"]
@@ -1316,13 +1659,25 @@ class ProjectTab(ttk.Frame):
         if self.vertex_follow_active:
             ln, idx = self.dragging_vertex
             ix2, iy2 = self.canvas_event_to_img(event)
-            ax, ay, orig_angle = self.vertex_move_anchor
-            fx, fy = self._constrained_vertex_point(
-                ln, (ax, ay), orig_angle, ix2, iy2, bool(event.state & 0x0001))
+            ellipse = self.ellipse_for_line(ln.id)
+            if ellipse:
+                # Ellipse diameter endpoints reshape freely, no collinear-
+                # extend constraint (that's a plain-line feature) -- and the
+                # opposite end of this SAME diameter line is kept mirrored
+                # through the center, which is what actually redefines the
+                # ellipse's shape (see Ellipse.canonical).
+                fx, fy = self._apply_snap(ix2, iy2, exclude_ids=(ln.id,))
+            else:
+                ax, ay, orig_angle = self.vertex_move_anchor
+                fx, fy = self._constrained_vertex_point(
+                    ln, (ax, ay), orig_angle, ix2, iy2, bool(event.state & 0x0001))
             if idx == 1:
                 ln.x1, ln.y1 = fx, fy
             else:
                 ln.x2, ln.y2 = fx, fy
+            if ellipse:
+                self.mirror_diameter_endpoint(ellipse, ln, idx)
+                ellipse.recompute_shape(self)
             self.vertex_follow_active = False
             self.dragging_vertex = None
             self.vertex_move_anchor = None
@@ -1334,6 +1689,50 @@ class ProjectTab(ttk.Frame):
 
         ix, iy = self.canvas_event_to_img(event)
         tol_img = HIT_TOLERANCE / self.scale
+
+        # Circle draw tool: every click just places the next of this
+        # circle's 3 defining points (center, then 2 circumference points --
+        # see _finalize_circle). Checked before Ctrl/Shift handling below so
+        # those modifiers don't interfere with placing points -- Circle mode
+        # doesn't use them for anything else.
+        if self.app.mode.get() == "circle" and not (event.state & 0x0001) and not (event.state & 0x0004):
+            # A plain click places the next point. Shift/Ctrl held falls
+            # through to the normal Shift-grab (reshape/rotate/move an
+            # EXISTING circle) or Ctrl-click (select) handling below, same
+            # as Draw/Select mode -- Circle mode only owns plain clicks.
+            if self.circle_points is None:
+                self.circle_points = []
+            ix, iy = self._apply_snap(ix, iy)
+            self.circle_points.append((ix, iy))
+            if len(self.circle_points) == 1:
+                self.app.set_status(
+                    "Circle: click a point on its circumference (1st diameter).")
+            elif len(self.circle_points) == 2:
+                self.app.set_status(
+                    "Circle: click a 2nd circumference point in a different "
+                    "direction across the circle to finish it, or Esc to cancel.")
+            else:
+                self._finalize_circle()
+            return
+
+        # Ctrl+Shift+grab on one of an ellipse's diameter endpoints rotates
+        # that diameter WITHIN its already-fixed ellipse boundary -- the
+        # ellipse's shape never changes, only where along it this point (and
+        # its mirrored opposite) sit. Checked before the plain Ctrl+click
+        # (select-any-color) handling just below, since Ctrl+Shift together
+        # would otherwise just look like a Ctrl+click to that check.
+        if bool(event.state & 0x0001) and bool(event.state & 0x0004):  # Shift+Control
+            hit = self.find_vertex_near(ix, iy, tol_img)
+            if hit:
+                vline, vidx = hit
+                ellipse = self.ellipse_for_line(vline.id)
+                if ellipse:
+                    self._push_undo()
+                    semi_a, semi_b, phi = ellipse.canonical(self)
+                    self.rotating_diameter = (ellipse, vline, vidx, semi_a, semi_b, phi)
+                    self.select_line(vline.id)
+                    return
+            # not a rotate-able hit -- fall through to the normal handling below
 
         # Ctrl+click selects whatever line is under the cursor, regardless
         # of its color and regardless of Draw/Select mode -- a miss does
@@ -1378,6 +1777,23 @@ class ProjectTab(ttk.Frame):
                 self.select_line(vline.id)
                 return
             ln = self.find_line_near(ix, iy, tol_img)
+            ellipse = self.ellipse_for_line(ln.id) if ln else None
+            if ellipse is None:
+                ellipse = self.find_ellipse_near(ix, iy, tol_img)
+            if ellipse:
+                # Grabbing a diameter line's BODY (not its endpoint), or the
+                # ellipse's own curve, moves the WHOLE circle -- center plus
+                # both diameters' 4 points, all by the same delta -- rather
+                # than just that one line (which would desync it from the
+                # shared center).
+                self._push_undo()
+                a = self._line_by_id(ellipse.line_a_id)
+                b = self._line_by_id(ellipse.line_b_id)
+                self.moving_ellipse = (
+                    ellipse, ellipse.cx, ellipse.cy,
+                    (a.x1, a.y1, a.x2, a.y2), (b.x1, b.y1, b.x2, b.y2), ix, iy)
+                self.select_ellipse(ellipse)
+                return
             if ln:
                 self._push_undo()
                 self.moving_line = (ln, ln.x1, ln.y1, ln.x2, ln.y2, ix, iy)
@@ -1388,6 +1804,8 @@ class ProjectTab(ttk.Frame):
             ln = self.find_line_near(ix, iy, tol_img)
             if ln:
                 self.select_line(ln.id)
+            elif self.find_ellipse_near(ix, iy, tol_img):
+                self.select_ellipse(self.find_ellipse_near(ix, iy, tol_img))
             else:
                 self.select_line(None)
             return
@@ -1422,6 +1840,33 @@ class ProjectTab(ttk.Frame):
         if not self.pil_image:
             return
 
+        if self.rotating_diameter is not None:
+            ellipse, vline, vidx, semi_a, semi_b, phi = self.rotating_diameter
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            dx, dy = ix - ellipse.cx, iy - ellipse.cy
+            if dx != 0 or dy != 0:
+                t = ellipse_param_for_direction(ellipse.cx, ellipse.cy, semi_a, semi_b, phi, dx, dy)
+                px, py = ellipse_point_at(ellipse.cx, ellipse.cy, semi_a, semi_b, phi, t)
+                if vidx == 1:
+                    vline.x1, vline.y1 = px, py
+                else:
+                    vline.x2, vline.y2 = px, py
+                self.mirror_diameter_endpoint(ellipse, vline, vidx)
+            self.redraw()
+            return
+
+        if self.moving_ellipse is not None:
+            ellipse, ocx, ocy, oa, ob, aix, aiy = self.moving_ellipse
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            dx, dy = ix - aix, iy - aiy
+            ellipse.cx, ellipse.cy = ocx + dx, ocy + dy
+            a = self._line_by_id(ellipse.line_a_id)
+            b = self._line_by_id(ellipse.line_b_id)
+            a.x1, a.y1, a.x2, a.y2 = oa[0] + dx, oa[1] + dy, oa[2] + dx, oa[3] + dy
+            b.x1, b.y1, b.x2, b.y2 = ob[0] + dx, ob[1] + dy, ob[2] + dx, ob[3] + dy
+            self.redraw()
+            return
+
         if self.dragging_vertex is not None:
             ln, idx = self.dragging_vertex
             # Once the mouse has moved far enough, this press-and-hold
@@ -1434,13 +1879,25 @@ class ProjectTab(ttk.Frame):
                     dist((event.x, event.y), self.press_canvas) >= CLICK_MOVE_THRESHOLD:
                 self.press_moved = True
             ix, iy = self.canvas_to_img(event.x, event.y)
-            ax, ay, orig_angle = self.vertex_move_anchor
-            ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
-                                                      bool(event.state & 0x0001))
+            ellipse = self.ellipse_for_line(ln.id)
+            if ellipse:
+                # Ellipse diameter endpoints reshape freely -- no collinear-
+                # extend constraint (that's a plain-line feature); the
+                # opposite end of this SAME diameter line is kept mirrored
+                # through the center, which is what actually redefines the
+                # ellipse's shape (see Ellipse.canonical).
+                ix, iy = self._apply_snap(ix, iy, exclude_ids=(ln.id,))
+            else:
+                ax, ay, orig_angle = self.vertex_move_anchor
+                ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
+                                                          bool(event.state & 0x0001))
             if idx == 1:
                 ln.x1, ln.y1 = ix, iy
             else:
                 ln.x2, ln.y2 = ix, iy
+            if ellipse:
+                self.mirror_diameter_endpoint(ellipse, ln, idx)
+                ellipse.recompute_shape(self)
             self.redraw()
             return
 
@@ -1511,14 +1968,25 @@ class ProjectTab(ttk.Frame):
         if self.vertex_follow_active:
             ln, idx = self.dragging_vertex
             ix, iy = self.canvas_to_img(event.x, event.y)
-            ax, ay, orig_angle = self.vertex_move_anchor
-            ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
-                                                      bool(event.state & 0x0001))
+            ellipse = self.ellipse_for_line(ln.id)
+            if ellipse:
+                ix, iy = self._apply_snap(ix, iy, exclude_ids=(ln.id,))
+            else:
+                ax, ay, orig_angle = self.vertex_move_anchor
+                ix, iy = self._constrained_vertex_point(ln, (ax, ay), orig_angle, ix, iy,
+                                                          bool(event.state & 0x0001))
             if idx == 1:
                 ln.x1, ln.y1 = ix, iy
             else:
                 ln.x2, ln.y2 = ix, iy
+            if ellipse:
+                self.mirror_diameter_endpoint(ellipse, ln, idx)
+                ellipse.recompute_shape(self)
             self.redraw()
+            return
+
+        if self.app.mode.get() == "circle" and self.circle_points:
+            self._update_circle_preview(event)
             return
 
         if self.app.mode.get() != "draw":
@@ -1548,6 +2016,22 @@ class ProjectTab(ttk.Frame):
 
     def on_canvas_release(self, event):
         if not self.pil_image:
+            return
+
+        if self.rotating_diameter is not None:
+            ellipse, vline = self.rotating_diameter[0], self.rotating_diameter[1]
+            self.rotating_diameter = None
+            self.redraw()
+            self.mark_dirty()
+            self.app.set_status(f"Rotated line #{vline.id} within circle #{ellipse.id}.")
+            return
+
+        if self.moving_ellipse is not None:
+            ellipse = self.moving_ellipse[0]
+            self.moving_ellipse = None
+            self.redraw()
+            self.mark_dirty()
+            self.app.set_status(f"Moved circle #{ellipse.id}.")
             return
 
         if self.dragging_vertex is not None:
@@ -1655,6 +2139,137 @@ class ProjectTab(ttk.Frame):
                 return ln
         return None
 
+    def _ellipse_by_id(self, ellipse_id):
+        for el in self.ellipses:
+            if el.id == ellipse_id:
+                return el
+        return None
+
+    def ellipse_for_line(self, line_id):
+        """The Ellipse a diameter Line belongs to, or None if it's an
+        ordinary (non-diameter) line."""
+        for el in self.ellipses:
+            if el.line_a_id == line_id or el.line_b_id == line_id:
+                return el
+        return None
+
+    def mirror_diameter_endpoint(self, ellipse, line, moved_end):
+        """Keep a diameter Line's 2 endpoints exactly opposite the shared
+        center: whichever endpoint (1 or 2) was just moved, force the OTHER
+        one to 2*center - moved_point. Called after directly setting
+        line.x{moved_end},y{moved_end} so both ends stay a straight line
+        through the center at all times."""
+        if moved_end == 1:
+            line.x2 = 2 * ellipse.cx - line.x1
+            line.y2 = 2 * ellipse.cy - line.y1
+        else:
+            line.x1 = 2 * ellipse.cx - line.x2
+            line.y1 = 2 * ellipse.cy - line.y2
+
+    def find_ellipse_near(self, ix, iy, tolerance_img):
+        """Return the Ellipse whose CURVE (not its 2 diameter lines, which
+        find_line_near/find_vertex_near already cover) is within tolerance
+        of (ix, iy), or None. Used so clicking/Shift-grabbing the boundary
+        of a circle -- not one of the straight lines through it -- still
+        hits something (selects it / moves the whole thing)."""
+        best, best_d = None, tolerance_img
+        for el in self.ellipses:
+            semi_a, semi_b, phi = el.canonical(self)
+            nx, ny = ellipse_nearest_point(el.cx, el.cy, semi_a, semi_b, phi, ix, iy)
+            d = dist((ix, iy), (nx, ny))
+            if d <= best_d:
+                best, best_d = el, d
+        return best
+
+    def select_ellipse(self, ellipse):
+        """Select both of an Ellipse's diameter lines together, so the
+        whole circle highlights (rather than just one line)."""
+        a = self._line_by_id(ellipse.line_a_id)
+        b = self._line_by_id(ellipse.line_b_id)
+        self.selected_line_ids = [i for i in (a.id if a else None, b.id if b else None) if i]
+        self.redraw()
+        self.populate_known_length_field()
+        self._maybe_advance_parallel_pick()
+
+    # --------------------------------------------------------- circle tool
+    def cancel_circle(self, event=None):
+        """Escape, or switching modes/tabs/images: abandon a circle that's
+        mid-click (center and/or 1st circumference point placed, but not
+        yet finished)."""
+        if not self.circle_points:
+            self.circle_points = None
+            return
+        self.circle_points = None
+        if self._circle_preview_ids:
+            self.canvas.delete(*self._circle_preview_ids)
+            self._circle_preview_ids = []
+        self.app.set_status("Circle cancelled.")
+
+    def _update_circle_preview(self, event):
+        """Live dashed preview while a circle's center (and maybe its 1st
+        circumference point) has been placed and the 2nd/3rd click is
+        still pending -- shows the diameter(s) already committed, full-
+        length through the center, plus a preview of the one following the
+        cursor right now."""
+        if self._circle_preview_ids:
+            self.canvas.delete(*self._circle_preview_ids)
+            self._circle_preview_ids = []
+        ix, iy = self.canvas_to_img(event.x, event.y)
+        ix, iy = self._apply_snap(ix, iy)
+        cx, cy = self.circle_points[0]
+        color_hex = ORANGE_META["hex"]
+
+        def preview_diameter(px, py, dash):
+            sx, sy = self.img_to_canvas(2 * cx - px, 2 * cy - py)
+            ex, ey = self.img_to_canvas(px, py)
+            self._circle_preview_ids.append(self.canvas.create_line(
+                sx, sy, ex, ey, fill=color_hex, width=2, dash=dash))
+
+        if len(self.circle_points) >= 2:
+            ax, ay = self.circle_points[1]
+            preview_diameter(ax, ay, None)   # 1st diameter, already placed
+        preview_diameter(ix, iy, (4, 2))     # the one following the cursor
+
+    def _finalize_circle(self):
+        """The 3rd click of the Circle tool: creates the Ellipse and its 2
+        orange diameter Lines from the 3 points collected (center, then 2
+        circumference points -- see on_canvas_press). The 2 points must
+        genuinely define 2 different directions from the center (not the
+        same line through it), or there's no ellipse to build."""
+        (cx, cy), (ax, ay), (bx, by) = self.circle_points
+        self.circle_points = None
+        if self._circle_preview_ids:
+            self.canvas.delete(*self._circle_preview_ids)
+            self._circle_preview_ids = []
+
+        ux, uy = ax - cx, ay - cy
+        vx, vy = bx - cx, by - cy
+        min_radius_px = 3 / self.scale
+        if dist((0, 0), (ux, uy)) < min_radius_px or dist((0, 0), (vx, vy)) < min_radius_px:
+            self.app.set_status("Circle too small -- not created.")
+            return
+        cross = ux * vy - uy * vx
+        if abs(cross) < 1e-6 * (abs(ux) + abs(uy) + abs(vx) + abs(vy) + 1):
+            self.app.set_status(
+                "Those 2 circumference points are on the same line through the "
+                "center -- pick a 2nd point in a different direction to define "
+                "the circle.")
+            return
+
+        self._push_undo()
+        line_a = Line(ORANGE_COLOR, cx - ux, cy - uy, cx + ux, cy + uy)
+        line_b = Line(ORANGE_COLOR, cx - vx, cy - vy, cx + vx, cy + vy)
+        self.lines.append(line_a)
+        self.lines.append(line_b)
+        ellipse = Ellipse(cx, cy, line_a.id, line_b.id)
+        ellipse.recompute_shape(self)
+        self.ellipses.append(ellipse)
+        self.select_ellipse(ellipse)
+        self.mark_dirty()
+        self.app.set_status(
+            f"Circle #{ellipse.id} created (diameter lines #{line_a.id}, #{line_b.id} -- "
+            "orange until assigned to an axis; see the known-length panel).")
+
     # ------------------------------------------------------------- mode
     def on_mode_changed(self):
         """Called for the active tab whenever the shared draw/select mode
@@ -1663,9 +2278,12 @@ class ProjectTab(ttk.Frame):
         self.cancel_vertex_follow()
         self.dragging_vertex = None
         self.moving_line = None
+        self.moving_ellipse = None
+        self.rotating_diameter = None
         self.drag_start_img = None
         self.cancel_click_draw()
-        self.canvas.config(cursor="crosshair" if self.app.mode.get() == "draw" else "hand2")
+        self.cancel_circle()
+        self.canvas.config(cursor="crosshair" if self.app.mode.get() in ("draw", "circle") else "hand2")
 
     def cancel_click_draw(self, event=None):
         """Escape (when not busy reverting a known-length edit -- see
@@ -1798,6 +2416,9 @@ class ProjectTab(ttk.Frame):
         if self.vertex_follow_active:
             self.cancel_vertex_follow()
             return
+        if self.circle_points:
+            self.cancel_circle()
+            return
         self.cancel_click_draw()
 
     # -------------------------------------------------------------- redraw
@@ -1805,17 +2426,46 @@ class ProjectTab(ttk.Frame):
         if not self.pil_image:
             self._show_placeholder()
             return
-        self.canvas.delete("line", "label", "handle")
+        self.canvas.delete("line", "label", "handle", "ellipse")
+        for el in self.ellipses:
+            self._draw_ellipse(el)
         for ln in self.lines:
             self._draw_line(ln)
         self._update_tree()
         self._update_axis_labels()
         self.app.refresh_toolbar_hint(self)
 
+    def _draw_ellipse(self, el):
+        """The circle's curve itself -- drawn as a many-segment polygon
+        (tk canvas has no rotated-oval primitive) UNDER its 2 diameter
+        lines/handles/labels, which _draw_line draws separately right
+        after this. Orange until BOTH diameter lines have been assigned to
+        a real axis, at which point it's shown in whichever color reads
+        as "most complete" -- a single axis color if both lines share one,
+        else it stays orange (mixed) since the circle as a whole doesn't
+        have one single axis."""
+        semi_a, semi_b, phi = el.canonical(self)
+        a = self._line_by_id(el.line_a_id)
+        b = self._line_by_id(el.line_b_id)
+        colors = {c for c in (a.color if a else None, b.color if b else None) if c}
+        color = colors.pop() if len(colors) == 1 else ORANGE_COLOR
+        meta = line_color_meta(color)
+        selected = bool(a and a.id in self.selected_line_ids) or bool(b and b.id in self.selected_line_ids)
+        outline = meta["select_hex"] if selected else meta["hex"]
+        pts = []
+        n = 72
+        for i in range(n + 1):
+            t = 2 * math.pi * i / n
+            px, py = ellipse_point_at(el.cx, el.cy, semi_a, semi_b, phi, t)
+            cx, cy = self.img_to_canvas(px, py)
+            pts.extend((cx, cy))
+        self.canvas.create_line(*pts, fill=outline, width=2 if not selected else 3,
+                                 tags=("line", "ellipse"))
+
     def _draw_line(self, ln):
         x1, y1 = self.img_to_canvas(ln.x1, ln.y1)
         x2, y2 = self.img_to_canvas(ln.x2, ln.y2)
-        meta = AXIS_COLORS[ln.color]
+        meta = line_color_meta(ln.color)
         selected = ln.id in self.selected_line_ids
         width = 4 if selected else 2
         outline = meta["select_hex"] if selected else meta["hex"]
@@ -1838,7 +2488,7 @@ class ProjectTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for ln in self.lines:
             value, unit, mode, denom = self.effective_display(ln)
-            axis = AXIS_COLORS[ln.color]["axis"]
+            axis = line_color_meta(ln.color)["axis"] or "-"
             self.tree.insert("", "end", iid=str(ln.id), values=(
                 ln.color, axis, f"{ln.pixel_length():.1f}",
                 self.format_display(value, unit, mode, denom) if value is not None else "?",
@@ -1920,7 +2570,7 @@ class ProjectTab(ttk.Frame):
                 self.known_length_var.set("" if ln.known_length is None else str(ln.known_length))
                 self.known_unit_var.set(ln.unit or self.app.default_unit.get())
                 self.selection_label.config(
-                    text=f"Line #{ln.id} ({ln.color}, {AXIS_COLORS[ln.color]['axis']}) "
+                    text=f"Line #{ln.id} ({ln.color}, {line_color_meta(ln.color)['axis'] or 'no axis'}) "
                          f"-- {ln.pixel_length():.1f} px")
                 self.display_mode_box.config(state="readonly")
                 self.display_unit_box.config(state="readonly")
@@ -1930,6 +2580,7 @@ class ProjectTab(ttk.Frame):
                 self.display_denominator_var.set(
                     f"1/{ln.display_denominator}" if ln.display_denominator else "(auto)")
                 self._update_denom_row_visibility(ln)
+                self._update_circle_panel(ln)
                 return
         self.known_length_var.set("")
         self.known_length_entry.config(state="disabled")
@@ -1941,10 +2592,128 @@ class ProjectTab(ttk.Frame):
         self.display_unit_box.config(state="disabled")
         self.display_denominator_box.config(state="disabled")
         self._update_denom_row_visibility(None)
+        self._update_circle_panel(None)
         if len(self.selected_line_ids) == 0:
             self.selection_label.config(text="No line selected")
         else:
             self.selection_label.config(text=f"{len(self.selected_line_ids)} lines selected")
+
+    def _update_circle_panel(self, ln):
+        """Refresh the Circle panel (axis-assignment buttons + known
+        radius/diameter field) for `ln` -- the single selected line, or
+        None. Enabled only when `ln` is one of a Circle's 2 diameter
+        lines (see ellipse_for_line)."""
+        ellipse = self.ellipse_for_line(ln.id) if ln else None
+        if ellipse is None:
+            for btn in self.circle_axis_buttons.values():
+                btn.config(state="disabled")
+            self.circle_known_entry.config(state="disabled")
+            self.circle_known_unit_box.config(state="disabled")
+            self.circle_known_kind_box.config(state="disabled")
+            self.circle_selection_label.config(text="No circle line selected")
+            return
+        for btn in self.circle_axis_buttons.values():
+            btn.config(state="normal")
+        self.circle_axis_var.set(ln.color)
+        self.circle_known_entry.config(state="normal")
+        self.circle_known_unit_box.config(state="readonly")
+        self.circle_known_kind_box.config(state="readonly")
+        self.circle_known_var.set(
+            "" if ellipse.known_value is None else str(ellipse.known_value))
+        self.circle_known_unit_var.set(ellipse.known_unit or self.app.default_unit.get())
+        self.circle_known_is_diameter_var.set(
+            "diameter" if ellipse.known_is_diameter else "radius")
+        self.circle_selection_label.config(
+            text=f"Circle #{ellipse.id} -- line #{ln.id} is its {ln.color} diameter")
+
+    def commit_circle_axis(self):
+        """Radiobutton in the Circle panel: reassign the selected diameter
+        line's color/axis. See assign_diameter_axis."""
+        if len(self.selected_line_ids) != 1:
+            return
+        ln = self._line_by_id(self.selected_line_ids[0])
+        if not ln or not self.ellipse_for_line(ln.id):
+            return
+        self.assign_diameter_axis(ln, self.circle_axis_var.get())
+
+    def assign_diameter_axis(self, line, new_color):
+        """Change a Circle diameter line's color -- from orange
+        (unassigned) onto a real measurement axis (red/green/blue), back
+        to orange, or between axes. Stays fully movable/rotatable
+        afterward, same as any other line. Assigning a real axis is what
+        turns the circle's own known radius/diameter (Ellipse.known_value,
+        set in the panel below) into THIS line's actual known_length --
+        e.g. 'this diameter is now the X axis, and the circle is 2 inches
+        across'. Moving it off an axis (back to orange, or onto a
+        different one) clears whatever known_length that assignment gave
+        it, since it no longer means what it used to."""
+        if line.color == new_color:
+            return
+        ellipse = self.ellipse_for_line(line.id)
+        self._push_undo()
+        line.color = new_color
+        if new_color != ORANGE_COLOR and ellipse and ellipse.known_value is not None:
+            line.known_length = (ellipse.known_value if ellipse.known_is_diameter
+                                  else ellipse.known_value * 2)
+            line.unit = ellipse.known_unit
+        else:
+            line.known_length = None
+            line.unit = None
+        self.mark_dirty()
+        self.redraw()
+        self.populate_known_length_field()
+        self.app.set_status(
+            f"Line #{line.id} is now {'unassigned (orange)' if new_color == ORANGE_COLOR else new_color}.")
+
+    def commit_circle_known_value(self, event=None):
+        """The Circle panel's known radius/diameter field: a real-world
+        size for the WHOLE circle (not either line individually -- see the
+        panel's docstring above). Propagates to whichever of its 2
+        diameter lines are already axis-assigned."""
+        if len(self.selected_line_ids) != 1:
+            return
+        ln = self._line_by_id(self.selected_line_ids[0])
+        if not ln:
+            return
+        ellipse = self.ellipse_for_line(ln.id)
+        if not ellipse:
+            return
+        text = self.circle_known_var.get().strip()
+        new_unit = self.circle_known_unit_var.get().strip() or self.app.default_unit.get()
+        is_diameter = self.circle_known_is_diameter_var.get() != "radius"
+        if text == "":
+            new_value = None
+        else:
+            parsed = parse_measurement(text)
+            if parsed is None:
+                self.app.set_status(
+                    "Circle's known radius/diameter must be a number, fraction, "
+                    "mixed number, or simple math (e.g. 2.5, 1/2, 2 1/2) -- or blank.")
+                return
+            new_value = float(parsed)
+            if new_value <= 0:
+                self.app.set_status("Circle's known radius/diameter must be greater than 0.")
+                return
+        changed = (ellipse.known_value != new_value or ellipse.known_unit != new_unit
+                   or ellipse.known_is_diameter != is_diameter)
+        if changed:
+            self._push_undo()
+        ellipse.known_value = new_value
+        ellipse.known_unit = new_unit
+        ellipse.known_is_diameter = is_diameter
+        for lid in (ellipse.line_a_id, ellipse.line_b_id):
+            other = self._line_by_id(lid)
+            if other and other.color != ORANGE_COLOR:
+                if new_value is None:
+                    other.known_length = None
+                    other.unit = None
+                else:
+                    other.known_length = new_value if is_diameter else new_value * 2
+                    other.unit = new_unit
+        if changed:
+            self.mark_dirty()
+        self.redraw()
+        self.populate_known_length_field()
 
     def commit_display_settings(self, event=None):
         """Apply the Display mode/unit/denominator combos to the single
@@ -2080,7 +2849,19 @@ class ProjectTab(ttk.Frame):
         if not self.selected_line_ids:
             return
         self._push_undo()
-        self.lines = [ln for ln in self.lines if ln.id not in self.selected_line_ids]
+        # Deleting either of a Circle's 2 diameter lines takes the WHOLE
+        # circle with it -- a lone diameter line (or an Ellipse with a
+        # missing line) doesn't mean anything on its own.
+        delete_ids = set(self.selected_line_ids)
+        remaining_ellipses = []
+        for el in self.ellipses:
+            if el.line_a_id in delete_ids or el.line_b_id in delete_ids:
+                delete_ids.add(el.line_a_id)
+                delete_ids.add(el.line_b_id)
+            else:
+                remaining_ellipses.append(el)
+        self.ellipses = remaining_ellipses
+        self.lines = [ln for ln in self.lines if ln.id not in delete_ids]
         self.selected_line_ids = []
         self.mark_dirty()
         self.redraw()
@@ -2119,6 +2900,7 @@ class ProjectTab(ttk.Frame):
             "image_data": image_data_b64,
             "rotation_turns": self.rotation_turns,
             "lines": [ln.to_dict() for ln in self.lines],
+            "ellipses": [el.to_dict() for el in self.ellipses],
             "axis_display_mode": self.axis_display_mode,
         }
         with open(path, "w", encoding="utf-8") as f:
@@ -2181,6 +2963,7 @@ class ProjectTab(ttk.Frame):
                 return False
 
         self.lines = [Line.from_dict(d) for d in data.get("lines", [])]
+        self.ellipses = [Ellipse.from_dict(d) for d in data.get("ellipses", [])]
         self.selected_line_ids = []
         self.project_path = path
         saved_modes = data.get("axis_display_mode") or {}
@@ -2211,7 +2994,7 @@ class ProjectTab(ttk.Frame):
             for ln in self.lines:
                 real, unit = self.computed_length(ln)
                 value, disp_unit, mode, denom = self.effective_display(ln)
-                w.writerow([ln.id, ln.color, AXIS_COLORS[ln.color]["axis"],
+                w.writerow([ln.id, ln.color, line_color_meta(ln.color)["axis"] or "",
                             f"{ln.x1:.2f}", f"{ln.y1:.2f}", f"{ln.x2:.2f}", f"{ln.y2:.2f}",
                             f"{ln.pixel_length():.2f}",
                             ln.known_length if ln.known_length else "",
@@ -2449,6 +3232,7 @@ class App:
 
         ttk.Label(bar, text="Mode:").pack(side="left", padx=(0, 4))
         ttk.Radiobutton(bar, text="Draw line", variable=self.mode, value="draw").pack(side="left")
+        ttk.Radiobutton(bar, text="Circle", variable=self.mode, value="circle").pack(side="left")
         ttk.Radiobutton(bar, text="Select", variable=self.mode, value="select").pack(side="left")
 
         # Compare 2 Lines / Delete used to also have toolbar buttons here --
@@ -2574,7 +3358,24 @@ class App:
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
             "14. The whole window -- every open tab, saved or not -- is "
-            "remembered automatically and restored next time you launch the app."
+            "remembered automatically and restored next time you launch the app.\n"
+            "15. 'Circle' mode draws a circle-in-perspective (an ellipse): click "
+            "its center, then 2 points on its circumference in different "
+            "directions -- the 2nd point doesn't need to be a right angle from "
+            "the 1st, any 2 different directions work. This makes an ellipse "
+            "plus its 2 diameter LINES (shown in orange, a 4th color that isn't "
+            "a measurement axis until you assign one). Shift-drag a diameter "
+            "endpoint to reshape the ellipse; Ctrl+Shift-drag one instead to "
+            "ROTATE it -- slide it around the circle's already-fixed boundary "
+            "without changing the circle's shape (Make Parallel does this too, "
+            "for a diameter line). Shift-drag the circle's own curve (not "
+            "either diameter line) to move the whole thing. The Circle panel "
+            "(under the known-length field, when a diameter line is selected) "
+            "assigns that line to a real axis (Red/Green/Blue) or back to "
+            "orange, and sets the circle's own known radius or diameter -- "
+            "once assigned to an axis, that becomes the line's known length, "
+            "same as typing one in directly. Snap Mode also pulls onto a "
+            "circle's exact center and its edge."
         ))
 
     # -------------------------------------------------------------- tabs

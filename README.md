@@ -233,14 +233,53 @@ If you want a project to survive on its own regardless, use Save Project.
     and puts the point back exactly where it was. An actual press-and-hold
     drag past the usual click threshold still finalizes immediately on
     release, same as before -- this is only for a genuine short click.
+- **Circles** (a 4th, "orange" line type): pick **Circle** mode and click 3
+  points -- the center, then a point on the circumference, then a 2nd point
+  on the circumference in a *different* direction (it doesn't need to be a
+  right angle from the 1st one). This draws an ellipse -- a circle seen at
+  whatever perspective the photo shows it from -- plus its 2 diameter
+  **lines**, each running the full width of the circle through the center.
+  Both start out **orange**, a 4th line color that (unlike Red/Green/Blue)
+  isn't a measurement axis on its own -- it just marks "this diameter isn't
+  assigned to an axis yet."
+    - **Reshaping**: Shift-drag any of the ellipse's 4 defining points (the
+      2 diameter lines' 4 endpoints) to move it freely -- the point directly
+      opposite it (through the center, on the same line) mirrors
+      automatically, and the ellipse's shape updates to match. This is how
+      you fit the ellipse to what's actually in the photo.
+    - **Rotating**: Ctrl+Shift-drag a diameter endpoint instead to *rotate*
+      it -- this slides the point around the ellipse's current (already-
+      fixed) boundary instead of reshaping it, so the circle's size/shape
+      never changes, only where its 2 diameters point. **Make Parallel**
+      does the same thing to a diameter line: it rotates within the fixed
+      ellipse to match the reference direction, rather than pivoting freely
+      like an ordinary line would (which would pull it off the circle).
+    - **Moving the whole circle**: Shift-drag the ellipse's own curve
+      (not one of the 2 straight diameter lines) to translate the entire
+      thing -- center and all 4 points together, shape unchanged.
+    - **Known size and axis assignment**: select one of a circle's diameter
+      lines and the **Circle** panel (below the known-length field) shows
+      buttons to assign that line to a real axis (Red/Green/Blue) -- or
+      back to orange/unassigned -- plus a field for the circle's own known
+      radius or diameter. Once a diameter is assigned to an axis, that
+      known radius/diameter (doubled, if you entered a radius) becomes
+      *that line's* known length automatically, calibrating the axis just
+      like typing a known length in directly. It stays fully movable,
+      reshapable, and rotatable afterward, same as any other line.
+      Reassigning it (to a different axis, or back to orange) clears that
+      known length, since it no longer means the same thing.
+    - Deleting either of a circle's 2 diameter lines deletes the whole
+      circle. Undo/redo, Save Project, and Snap Mode (below) all cover
+      circles the same way they cover ordinary lines.
 - **Snap Mode** (toolbar checkbox, Edit menu, or press **S**): while on,
   placing or moving a point -- drawing a new line's endpoints, or
-  Shift-dragging an existing vertex -- pulls it onto a nearby vertex first,
-  or the nearest point along a nearby line's body if no vertex is close
-  enough, within the same hit-test distance used for clicking a line. A
-  point never snaps onto the very line/vertex it's already part of. Off by
-  default; toggling it back off goes back to placing points exactly where
-  you click.
+  Shift-dragging an existing vertex -- pulls it onto a nearby vertex first
+  (a circle's exact center counts as a vertex here too), or the nearest
+  point along a nearby line's body or a nearby circle's edge if no vertex
+  is close enough, within the same hit-test distance used for clicking a
+  line. A point never snaps onto the very line/vertex it's already part of.
+  Off by default; toggling it back off goes back to placing points exactly
+  where you click.
 - **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
   drawing a line, deleting line(s), dragging an endpoint (one step per drag,
   not per pixel it moved), Make Parallel, a known-length or Display-section
