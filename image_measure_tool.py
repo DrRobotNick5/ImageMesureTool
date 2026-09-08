@@ -92,6 +92,7 @@ UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4, "ft": 304.8}
 FRACTION_DENOMINATOR_CHOICES = [2, 4, 8, 16, 32, 64]
 DEFAULT_FRACTION_DENOMINATOR = 32
 DISPLAY_MODE_CHOICES = ["decimal", "fraction"]
+DEFAULT_DISPLAY_MODE = "decimal"
 HANDLE_RADIUS = 5
 HIT_TOLERANCE = 6  # pixels, in canvas/screen space
 CLICK_MOVE_THRESHOLD = 4  # canvas pixels of movement that turns a click into a drag
@@ -222,13 +223,6 @@ def parse_measurement(text):
         return _eval_fraction_node(tree)
     except (SyntaxError, ValueError, ZeroDivisionError, TypeError):
         return None
-
-
-def looks_like_fraction_input(text):
-    """Whether a measurement string used fraction notation anywhere (a
-    '/') -- used to decide whether an axis's computed lines should
-    default to displaying as fractions too."""
-    return text is not None and "/" in text
 
 
 def format_fraction(value, denominator):
@@ -466,12 +460,18 @@ class ProjectTab(ttk.Frame):
                                                   # known-length edit, for Escape to revert to
         self._suppress_next_focus_snapshot = False  # see maybe_start_length_edit /
                                                        # _capture_length_edit_snapshot
-        # Per-axis default DISPLAY mode ('decimal' or 'fraction') for lines
-        # that don't have their own display_mode override. Set automatically
-        # whenever a known length is committed for that color: typing it as
-        # a fraction ("2 1/2", "3/4") switches that axis's other lines to
-        # showing fractions too; typing a plain decimal switches it back.
-        self.axis_display_mode = {color: "decimal" for color in AXIS_COLORS}
+        # NOT used to resolve display mode any more (see effective_display)
+        # -- kept only so old session/project files that still have this
+        # key load without error. It used to auto-lock an axis to
+        # decimal/fraction based on how the last-typed known length looked
+        # (a '/' vs. a '.'), but that silently fought with Settings >
+        # Default Display Mode -- flipping the global setting had no
+        # visible effect the moment ANY line on an axis had ever been
+        # typed with a decimal point, which is most of them. Display mode
+        # is now resolved purely as: this line's own Display-dropdown
+        # override, else the live, global Default Display Mode setting --
+        # no hidden per-axis state to get stuck.
+        self.axis_display_mode = {color: None for color in AXIS_COLORS}
 
         self._build_body()
 
@@ -566,15 +566,20 @@ class ProjectTab(ttk.Frame):
         self.display_unit_box.pack(side="left", padx=(4, 0))
         self.display_unit_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
 
-        denom_row = ttk.Frame(known_frame)
-        denom_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(denom_row, text="Fraction denom:").pack(side="left")
+        # Only meaningful in fraction mode -- kept out of the layout (not
+        # just disabled) whenever the selected line is effectively showing
+        # decimal, so it doesn't sit there uselessly. See
+        # _update_denom_row_visibility.
+        self.denom_row = ttk.Frame(known_frame)
+        self.denom_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(self.denom_row, text="Fraction denom:").pack(side="left")
         self.display_denominator_var = tk.StringVar(value="(auto)")
         self.display_denominator_box = ttk.Combobox(
-            denom_row, textvariable=self.display_denominator_var, width=8, state="disabled",
+            self.denom_row, textvariable=self.display_denominator_var, width=8, state="disabled",
             values=["(auto)"] + [f"1/{d}" for d in FRACTION_DENOMINATOR_CHOICES])
         self.display_denominator_box.pack(side="left", padx=(4, 0))
         self.display_denominator_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
+        self._denom_row_visible = True
 
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
         columns = ("color", "axis", "px", "real", "calib")
@@ -901,10 +906,13 @@ class ProjectTab(ttk.Frame):
         SHOWN with -- computed_length()'s value/unit, converted to this
         line's own display_unit override if it has one (falling back to
         the calibration unit if that conversion isn't possible, e.g. px),
-        its display_mode override if it has one (else this axis's current
-        default -- see commit_known_length / axis_display_mode), and its
-        own display_denominator override if it has one (else the
-        program-wide Settings > Fraction Denominator)."""
+        its display_mode override if it has one (else the program-wide
+        Settings > Default Display Mode, followed live -- there's no
+        per-axis state in between, so this always reflects the current
+        setting the instant it's changed, for any line without its own
+        Display-dropdown override), and its own display_denominator
+        override if it has one (else the program-wide Settings > Fraction
+        Denominator)."""
         real, calib_unit = self.computed_length(line)
         if real is None:
             return None, None, None, None
@@ -913,7 +921,7 @@ class ProjectTab(ttk.Frame):
         if value is None:
             unit = calib_unit
             value = real
-        mode = line.display_mode or self.axis_display_mode.get(line.color, "decimal")
+        mode = line.display_mode or self.app.default_display_mode.get()
         denom = line.display_denominator or self.app.fraction_denominator.get()
         return value, unit, mode, denom
 
@@ -1151,8 +1159,16 @@ class ProjectTab(ttk.Frame):
             return
 
         color = self.app.current_color.get()
-        line = Line(color, ix1, iy1, ix2, iy2, unit=self.app.default_unit.get(),
-                    parallel_to=parallel_to)
+        # No unit is stamped on the line yet -- it stays None (no known
+        # length either) until a real known length is actually committed
+        # for it, so the known-length field keeps showing whatever
+        # Settings > Default Unit currently is, live, for as long as this
+        # line has no known length of its own (see populate_known_length_
+        # field and commit_known_length). Stamping a unit here at draw
+        # time used to freeze it in immediately, which meant changing
+        # Default Unit afterward had no visible effect on this line even
+        # though nothing had actually been measured for it yet.
+        line = Line(color, ix1, iy1, ix2, iy2, parallel_to=parallel_to)
         self.lines.append(line)
         self.select_line(line.id)   # also redraws and populates the known-length field
         self.mark_dirty()
@@ -1375,6 +1391,20 @@ class ProjectTab(ttk.Frame):
         self.populate_known_length_field()
 
     # ------------------------------------------------- known-length field
+    def _update_denom_row_visibility(self, ln):
+        """Show the Fraction denom row only when the display mode actually
+        in effect for `ln` right now (its own override, else the live
+        Settings > Default Display Mode) is 'fraction' -- it's meaningless
+        in decimal mode, so it's removed from the layout entirely rather
+        than just greyed out."""
+        mode = (ln.display_mode or self.app.default_display_mode.get()) if ln else None
+        visible = mode == "fraction"
+        if visible and not self._denom_row_visible:
+            self.denom_row.pack(fill="x", pady=(4, 0))
+        elif not visible and self._denom_row_visible:
+            self.denom_row.pack_forget()
+        self._denom_row_visible = visible
+
     def populate_known_length_field(self):
         """Refresh the always-visible known-length field for the current
         selection. Enabled only when exactly one line is selected."""
@@ -1395,6 +1425,7 @@ class ProjectTab(ttk.Frame):
                 self.display_unit_var.set(ln.display_unit or "(auto)")
                 self.display_denominator_var.set(
                     f"1/{ln.display_denominator}" if ln.display_denominator else "(auto)")
+                self._update_denom_row_visibility(ln)
                 return
         self.known_length_var.set("")
         self.known_length_entry.config(state="disabled")
@@ -1405,6 +1436,7 @@ class ProjectTab(ttk.Frame):
         self.display_mode_box.config(state="disabled")
         self.display_unit_box.config(state="disabled")
         self.display_denominator_box.config(state="disabled")
+        self._update_denom_row_visibility(None)
         if len(self.selected_line_ids) == 0:
             self.selection_label.config(text="No line selected")
         else:
@@ -1414,8 +1446,8 @@ class ProjectTab(ttk.Frame):
         """Apply the Display mode/unit/denominator combos to the single
         selected line -- an override independent of its known length, used
         for both known and computed lines. '(auto)' clears an override
-        (back to the axis default / calibration unit / program-wide
-        Fraction Denominator setting, respectively)."""
+        (back to the live Settings > Default Display Mode / calibration
+        unit / program-wide Fraction Denominator setting, respectively)."""
         if len(self.selected_line_ids) != 1:
             return
         ln = self._line_by_id(self.selected_line_ids[0])
@@ -1427,6 +1459,7 @@ class ProjectTab(ttk.Frame):
         ln.display_mode = None if mode == "(auto)" else mode
         ln.display_unit = None if unit == "(auto)" else unit
         ln.display_denominator = None if denom == "(auto)" else int(denom.split("/")[1])
+        self._update_denom_row_visibility(ln)
         self.mark_dirty()
         self.redraw()
 
@@ -1455,15 +1488,18 @@ class ProjectTab(ttk.Frame):
                 return
             changed = ln.known_length != value
             ln.known_length = value
-            # Typing this known length as a fraction switches this AXIS's
-            # other lines (that don't have their own display override) to
-            # showing fractions by default too; a plain decimal switches
-            # that default back. Only a real edit does this -- reapplying
-            # the same already-committed text (e.g. a stray FocusOut)
-            # shouldn't flip the default back and forth.
-            if changed:
-                self.axis_display_mode[ln.color] = (
-                    "fraction" if looks_like_fraction_input(text) else "decimal")
+            # Typing a known length no longer has any side effect on
+            # display mode (decimal vs. fraction), for this line or any
+            # other -- it used to auto-lock the whole axis based on
+            # whether the text looked like a fraction ('/') or had a
+            # decimal point, which meant Settings > Default Display Mode
+            # silently stopped doing anything the moment any line on that
+            # axis had ever been typed with a '.', i.e. almost immediately
+            # for most real measurements. Display mode is controlled by
+            # exactly two things now: Settings > Default Display Mode
+            # (applies live, everywhere, to every line with no override),
+            # and the Display section's mode dropdown for a specific line
+            # (an explicit, visible override) -- nothing hidden in between.
         ln.unit = self.known_unit_var.get().strip() or self.app.default_unit.get()
         if changed:
             self.mark_dirty()
@@ -1508,8 +1544,8 @@ class ProjectTab(ttk.Frame):
         b_real = a_real * ratio
         # Display-only formatting -- b_real/a_unit (the exact decimal values
         # actually applied below) are unaffected by this.
-        a_mode = a.display_mode or self.axis_display_mode.get(a.color, "decimal")
-        b_mode = b.display_mode or self.axis_display_mode.get(b.color, "decimal")
+        a_mode = a.display_mode or self.app.default_display_mode.get()
+        b_mode = b.display_mode or self.app.default_display_mode.get()
         a_denom = a.display_denominator or self.app.fraction_denominator.get()
         b_denom = b.display_denominator or self.app.fraction_denominator.get()
 
@@ -1635,7 +1671,7 @@ class ProjectTab(ttk.Frame):
         self.project_path = path
         saved_modes = data.get("axis_display_mode") or {}
         self.axis_display_mode = {
-            color: saved_modes.get(color, "decimal") for color in AXIS_COLORS}
+            color: saved_modes.get(color) for color in AXIS_COLORS}
         self.dirty = False
         self.app.update_tab_title(self)
         self.fit_to_window()
@@ -1703,13 +1739,26 @@ class App:
         # The unit new lines get by default (Settings menu). Deliberately a
         # persistent, explicitly-chosen setting rather than "whatever unit
         # the last line used" -- so one line measured in an odd unit doesn't
-        # silently become the default for everything drawn after it.
+        # silently become the default for everything drawn after it. A
+        # line's own unit (Line.unit) stays None -- and keeps following
+        # this setting live -- until a known length is actually committed
+        # for it, at which point it's real measured data and stops
+        # following (see ProjectTab.on_canvas_release / commit_known_length).
         self.default_unit = tk.StringVar(value=DEFAULT_UNIT)
+        self.default_unit.trace_add("write", self._on_default_unit_change)
         # How finely a "fraction" display rounds (Settings menu), program-
         # wide -- e.g. 32 means "nearest 1/32". Affects every line currently
         # showing in fraction mode, on every open tab.
         self.fraction_denominator = tk.IntVar(value=DEFAULT_FRACTION_DENOMINATOR)
         self.fraction_denominator.trace_add("write", self._on_fraction_denominator_change)
+        # Whether a line with no Display-dropdown override of its own
+        # shows decimal or fraction lengths, program-wide (Settings menu).
+        # effective_display() falls back to this for every such line, so
+        # changing it takes effect immediately, everywhere, in every open
+        # tab -- typing a known length never overrides it (that's what the
+        # Display section's own mode dropdown is for, per line).
+        self.default_display_mode = tk.StringVar(value=DEFAULT_DISPLAY_MODE)
+        self.default_display_mode.trace_add("write", self._on_default_display_mode_change)
 
         self._build_menu()
         self._build_toolbar()
@@ -1782,6 +1831,12 @@ class App:
             denommenu.add_radiobutton(label=f"Nearest 1/{denom}", variable=self.fraction_denominator,
                                        value=denom)
         settingsmenu.add_cascade(label="Fraction Denominator", menu=denommenu)
+        displaymenu = tk.Menu(settingsmenu, tearoff=0)
+        displaymenu.add_radiobutton(label="Decimal", variable=self.default_display_mode,
+                                     value="decimal")
+        displaymenu.add_radiobutton(label="Fraction", variable=self.default_display_mode,
+                                     value="fraction")
+        settingsmenu.add_cascade(label="Default Display Mode", menu=displaymenu)
         menubar.add_cascade(label="Settings", menu=settingsmenu)
 
         helpmenu = tk.Menu(menubar, tearoff=0)
@@ -1924,12 +1979,15 @@ class App:
             "shown on the canvas and in the side list.\n"
             "5. The known-length field understands fractions and simple math, "
             "not just plain decimals: 1/2, 2 1/2 (a mixed number -- no + needed), "
-            "2 + 1/2, and 3/4 - 1/8 all work. Typing a fraction there switches "
-            "that AXIS's other lines to displaying as fractions too, rounded to "
-            "the nearest 1/32 by default (Settings > Fraction Denominator sets "
-            "that program-wide). The 'Display' row below it overrides just the "
-            "SELECTED line -- decimal vs. fraction, a different unit (e.g. show "
-            "a line as decimal mm even though its axis was calibrated in "
+            "2 + 1/2, and 3/4 - 1/8 all work -- but typing a value never changes "
+            "how lengths are DISPLAYED. Settings > Default Display Mode picks "
+            "decimal or fraction, program-wide, for every line that doesn't have "
+            "its own override -- flip it and every such line updates immediately, "
+            "in every open tab, rounded to the nearest 1/32 by default (Settings "
+            "> Fraction Denominator sets that program-wide too). The 'Display' "
+            "row below the known-length field overrides just "
+            "the SELECTED line -- decimal vs. fraction, a different unit (e.g. "
+            "show a line as decimal mm even though its axis was calibrated in "
             "fractional inches), and/or its OWN nearest-fraction denominator "
             "regardless of the program-wide setting -- independent of every "
             "other line, and independent of whether that line has its own "
@@ -2011,6 +2069,29 @@ class App:
         # takes effect everywhere at once.
         for tab in self._all_tabs():
             tab.redraw()
+
+    def _on_default_display_mode_change(self, *args):
+        # Any axis that's never had an explicit mode set (axis_display_mode
+        # is None for it) follows this setting live -- redraw every open
+        # tab so that takes effect immediately, and refresh the active
+        # tab's known-length panel too since the Fraction denom row's
+        # visibility depends on the now-current effective mode.
+        for tab in self._all_tabs():
+            tab.redraw()
+        tab = self.active_tab()
+        if tab:
+            tab.populate_known_length_field()
+
+    def _on_default_unit_change(self, *args):
+        # Only the active tab's known-length panel can be showing right
+        # now -- refresh it so a selected line with no unit of its own yet
+        # (nothing measured for it) immediately shows the new default in
+        # its unit box, instead of only picking it up next time that line
+        # gets (re)selected. A background tab's panel refreshes itself the
+        # same way whenever it becomes active (see _on_tab_changed).
+        tab = self.active_tab()
+        if tab:
+            tab.populate_known_length_field()
 
     def _on_tab_key(self, event, direction=1):
         tab = self.active_tab()
@@ -2137,7 +2218,8 @@ class App:
             active = self.notebook.index(self.notebook.select()) if tabs else 0
             data = {"version": 1, "active_index": active, "tabs": tabs_data,
                     "default_unit": self.default_unit.get(),
-                    "fraction_denominator": self.fraction_denominator.get()}
+                    "fraction_denominator": self.fraction_denominator.get(),
+                    "default_display_mode": self.default_display_mode.get()}
             os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
             tmp = SESSION_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -2159,6 +2241,8 @@ class App:
             self.default_unit.set(data["default_unit"])
         if data.get("fraction_denominator") in FRACTION_DENOMINATOR_CHOICES:
             self.fraction_denominator.set(data["fraction_denominator"])
+        if data.get("default_display_mode") in DISPLAY_MODE_CHOICES:
+            self.default_display_mode.set(data["default_display_mode"])
 
         restored_any = False
         notes = []
@@ -2200,7 +2284,7 @@ class App:
                 tab.selected_line_ids = []
                 saved_modes = entry.get("axis_display_mode") or {}
                 tab.axis_display_mode = {
-                    color: saved_modes.get(color, "decimal") for color in AXIS_COLORS}
+                    color: saved_modes.get(color) for color in AXIS_COLORS}
                 if entry.get("scale"):
                     tab.scale = entry["scale"]
                     tab.view_x = entry.get("view_x", tab.view_x)

@@ -122,19 +122,31 @@ If you want a project to survive on its own regardless, use Save Project.
   never jumps to another field while you're editing. Nothing is required,
   and you can always come back later by clicking the line (or its row in
   the list below) and typing again.
-- **Settings > Default Unit** sets which unit (mm/cm/m/in/ft/px) a newly
-  drawn line starts with, program-wide -- change it once instead of on
-  every line, and it's remembered the same way everything else is (see
-  "Where things are saved" above). Any individual line's unit can still be
-  changed afterward in its own known-length field regardless of this
-  setting.
-- **Fractions and per-line display**: typing a known length as a fraction
-  (anything with a `/` in it, like `1/2` or `2 1/2`) switches that line's
-  whole AXIS -- every other line of that color -- to displaying lengths as
-  fractions too, rounded to the nearest **1/32** by default; typing a plain
-  decimal switches it back. A displayed fraction always shows as one dash-
-  joined mixed number, e.g. `6-5/8 in`, not `6 5/8 in` -- so it can't be
-  misread as two separate numbers. **Settings > Fraction Denominator** changes
+- **Settings > Default Unit** sets which unit (mm/cm/m/in/ft/px) the
+  known-length field starts on for any line that hasn't actually been
+  measured yet, program-wide -- change it once instead of on every line,
+  and it's remembered the same way everything else is (see "Where things
+  are saved" above). It applies live: a line you already drew but haven't
+  typed a known length for yet keeps tracking this setting -- even while
+  it's the one currently selected -- right up until you actually commit a
+  known length for it. The moment you do, that unit becomes real measured
+  data for that specific line and stays put from then on, unaffected by
+  further Default Unit changes (exactly like any other line's unit can
+  always be changed by hand afterward in its own known-length field,
+  regardless of this setting).
+- **Fractions and per-line display**: the known-length field itself always
+  understands fraction notation (`1/2`, `2 1/2`, `2 + 1/2`) no matter how
+  lengths are currently being displayed -- but *typing* one never changes
+  how anything is displayed. Display mode (decimal vs. fraction) is
+  controlled by exactly two things, and nothing else: **Settings > Default
+  Display Mode**, and the per-line **Display** section described below.
+  **Settings > Default Display Mode** sets whether decimal or fraction is
+  used everywhere, program-wide, for any line that doesn't have its own
+  override -- flip it and every such line updates immediately, in every
+  open tab, whether it already existed or gets drawn afterward. A
+  displayed fraction always shows as one dash-joined mixed number, e.g.
+  `6-5/8 in`, not `6 5/8 in` -- so it can't be misread as two separate
+  numbers. **Settings > Fraction Denominator** changes
   what "nearest" rounds to program-wide (1/2 through 1/64). The **Display**
   section under the known-length field overrides just the *selected* line,
   independent of every other line and independent of whether it has its
@@ -146,10 +158,14 @@ If you want a project to survive on its own regardless, use Save Project.
   Denominator setting (handy for a line that needs finer or coarser
   rounding than the rest -- e.g. nearest 1/64 on one line while everything
   else stays at 1/32). Leave all three on **(auto)** to just follow the
-  axis default, calibration unit, and program-wide denominator, which is
-  what most lines want. (Pixels can't convert to/from a physical unit, so
-  a display unit of `px` only applies to a line whose axis is also
-  calibrated in `px`.)
+  program-wide Default Display Mode, calibration unit, and Fraction
+  Denominator, which is what most lines want. (Pixels can't convert to/from
+  a physical unit, so a display unit of `px` only applies to a line whose
+  axis is also calibrated in `px`.) The **Fraction denom** row only appears
+  when the selected line is actually showing as a fraction (its own
+  override, or the live Default Display Mode setting) -- it's meaningless
+  in decimal mode, so it stays out of the way rather than sitting there
+  disabled.
 - **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
   clockwise and keeps every line attached to the same spot on the picture.
   This rotation is remembered along with the project/session, so reopening
