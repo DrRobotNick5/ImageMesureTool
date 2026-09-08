@@ -57,6 +57,19 @@ import os
 import re
 import sys
 import tkinter as tk
+
+
+def resource_path(relative_path):
+    """Absolute path to a bundled resource (e.g. icon.ico), for both normal
+    `python image_measure_tool.py` runs and a PyInstaller-built .exe.
+    PyInstaller's --onefile mode unpacks bundled data files into a private
+    temp folder at runtime and exposes it as sys._MEIPASS; a plain script
+    run has no such attribute, so it falls back to the folder this .py file
+    lives in. Building the .exe must also actually bundle the file with
+    --add-data, e.g. --add-data "icon.ico;." on Windows -- --icon alone
+    only sets the .exe's own file icon, not what this function loads."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 from fractions import Fraction
 from tkinter import ttk, filedialog, messagebox
 
@@ -3003,6 +3016,16 @@ class App:
         self.root = root
         self.root.title(APP_NAME)
         self.root.geometry("1300x820")
+        # Sets the title-bar/taskbar/Alt-Tab icon (the running window's own
+        # icon) -- this is separate from PyInstaller's --icon flag, which
+        # only sets the icon Explorer shows for the built .exe FILE itself
+        # before it's even running. .iconbitmap only works with a real
+        # Windows .ico on Windows; harmless no-op elsewhere (e.g. this
+        # session's own Linux test runs), so any failure here is ignored.
+        try:
+            self.root.iconbitmap(default=resource_path("icon.ico"))
+        except tk.TclError:
+            pass
 
         self.current_color = tk.StringVar(value=DEFAULT_COLOR)
         self.mode = tk.StringVar(value="draw")
