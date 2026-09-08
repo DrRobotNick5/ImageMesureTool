@@ -108,10 +108,13 @@ If you want a project to survive on its own regardless, use Save Project.
   selected automatically and the **known length** field in the panel on the
   left shows it -- no popup, and nothing is focused yet, so **Tab**
   still switches color immediately if that's what you want to do next. To
-  set the length, just start typing a number -- that's what focuses the
-  field, replacing whatever was there, and it starts out in whatever unit
-  you've set as the **default unit** (Settings menu -- see below) rather
-  than making you re-pick a unit for every line. Enter commits it. While
+  set the length, just start typing -- that's what focuses the field,
+  replacing whatever was there, and it starts out in whatever unit you've
+  set as the **default unit** (Settings menu -- see below) rather than
+  making you re-pick a unit for every line. It doesn't have to be a plain
+  decimal: fractions, mixed numbers, and simple math all work too --
+  `1/2`, `2 1/2` (no `+` needed), `2 + 1/2`, `3/4 - 1/8` are all valid and
+  parsed exactly, not through floating-point. Enter commits it. While
   you're editing, **Esc reverts the field to what it was before you started
   typing** (without changing the line at all) and **Tab (or Shift+Tab) does
   the same revert, then immediately switches color** -- so you can always
@@ -125,6 +128,28 @@ If you want a project to survive on its own regardless, use Save Project.
   "Where things are saved" above). Any individual line's unit can still be
   changed afterward in its own known-length field regardless of this
   setting.
+- **Fractions and per-line display**: typing a known length as a fraction
+  (anything with a `/` in it, like `1/2` or `2 1/2`) switches that line's
+  whole AXIS -- every other line of that color -- to displaying lengths as
+  fractions too, rounded to the nearest **1/32** by default; typing a plain
+  decimal switches it back. A displayed fraction always shows as one dash-
+  joined mixed number, e.g. `6-5/8 in`, not `6 5/8 in` -- so it can't be
+  misread as two separate numbers. **Settings > Fraction Denominator** changes
+  what "nearest" rounds to program-wide (1/2 through 1/64). The **Display**
+  section under the known-length field overrides just the *selected* line,
+  independent of every other line and independent of whether it has its
+  own known length or is only computed from the axis: pick **decimal** or
+  **fraction**, a different unit than the axis was calibrated in (e.g. a
+  line calibrated in fractional inches can still show as decimal mm -- the
+  length is converted, not just relabeled), and/or that line's *own*
+  nearest-fraction denominator, regardless of the program-wide Fraction
+  Denominator setting (handy for a line that needs finer or coarser
+  rounding than the rest -- e.g. nearest 1/64 on one line while everything
+  else stays at 1/32). Leave all three on **(auto)** to just follow the
+  axis default, calibration unit, and program-wide denominator, which is
+  what most lines want. (Pixels can't convert to/from a physical unit, so
+  a display unit of `px` only applies to a line whose axis is also
+  calibrated in `px`.)
 - **Rotate 90°** (toolbar, or Edit menu) rotates the photo a quarter turn
   clockwise and keeps every line attached to the same spot on the picture.
   This rotation is remembered along with the project/session, so reopening
@@ -160,7 +185,10 @@ If you want a project to survive on its own regardless, use Save Project.
   another computer. See "Where things are saved" above for how this differs
   from the automatic session.
 - **Export Measurements (CSV)** dumps every line's pixel length, computed
-  real length, unit, color/axis, and endpoints to a spreadsheet-friendly file.
+  real length, unit, color/axis, and endpoints to a spreadsheet-friendly
+  file -- plus a `displayed_length` column with the same value formatted
+  the way it actually shows in the app (fraction or decimal, in that
+  line's own display unit).
 
 ## Notes / limitations
 

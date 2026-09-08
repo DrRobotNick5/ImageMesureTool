@@ -12,7 +12,12 @@ so you can have several photos/projects open at once.
     Blue  = Z
 - Assign a known real-world length to any line. Every other line drawn
   in that same color automatically gets a computed real-world length,
-  based on that axis's pixels-per-unit scale.
+  based on that axis's pixels-per-unit scale. Lengths can be typed as
+  fractions/mixed numbers/simple math (1/2, 2 1/2, 2 + 1/2), and every
+  line's DISPLAY (fraction vs. decimal, rounded to a configurable nearest
+  fraction, and which unit) can be set independently of how its axis was
+  calibrated -- see Line.display_mode/display_unit and
+  ProjectTab.effective_display.
 - Compare any two lines directly: pick a line with a known length and
   a second line, and the tool computes the second line's real-world
   length from the pixel-length ratio (independent of axis calibration).
@@ -41,13 +46,17 @@ Run:
     python image_measure_tool.py
 """
 
+import ast
 import base64
 import io
 import json
 import math
+import operator
 import os
+import re
 import sys
 import tkinter as tk
+from fractions import Fraction
 from tkinter import ttk, filedialog, messagebox
 
 try:
@@ -74,6 +83,15 @@ AXIS_COLORS = {
 DEFAULT_COLOR = "red"
 UNIT_CHOICES = ["mm", "cm", "m", "in", "ft", "px"]
 DEFAULT_UNIT = "mm"
+# Millimeters per unit, for converting a computed length into a DIFFERENT
+# display unit than the one its axis was calibrated in. "px" is deliberately
+# absent -- a pixel isn't a physical unit, so it can't be converted to/from
+# one; a line whose display unit would require that conversion just falls
+# back to showing its calibration unit instead (see ProjectTab.effective_display).
+UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4, "ft": 304.8}
+FRACTION_DENOMINATOR_CHOICES = [2, 4, 8, 16, 32, 64]
+DEFAULT_FRACTION_DENOMINATOR = 32
+DISPLAY_MODE_CHOICES = ["decimal", "fraction"]
 HANDLE_RADIUS = 5
 HIT_TOLERANCE = 6  # pixels, in canvas/screen space
 CLICK_MOVE_THRESHOLD = 4  # canvas pixels of movement that turns a click into a drag
@@ -137,6 +155,102 @@ def fmt_len(value, unit, decimals=3):
     return f"{value:.{decimals}g} {unit}"
 
 
+def convert_length(value, from_unit, to_unit):
+    """Convert a length between physical units (mm/cm/m/in/ft). Returns
+    None if either unit is missing or is "px" and they differ -- a pixel
+    isn't a physical unit, so it can't be converted to/from one; the
+    caller should fall back to the original unit in that case."""
+    if value is None or not from_unit or not to_unit:
+        return None
+    if from_unit == to_unit:
+        return value
+    if from_unit not in UNIT_TO_MM or to_unit not in UNIT_TO_MM:
+        return None
+    return value * UNIT_TO_MM[from_unit] / UNIT_TO_MM[to_unit]
+
+
+# ------------------------------------------------------- fraction input ----
+# A measurement can be typed as a plain decimal ("2.5"), a simple fraction
+# ("1/2"), a mixed number ("2 1/2" -- no operator needed, or "2+1/2"), or
+# basic arithmetic combining any of those ("2 + 1/2 - 3/8"). Everything is
+# evaluated exactly with fractions.Fraction (never float) so e.g. 1/3 stays
+# exact until the very last step, instead of accumulating binary-float error.
+
+_MIXED_NUMBER_RE = re.compile(r"(?<![\w./])(\d+)[ \t]+(\d+/\d+)(?![\d/])")
+
+_BINOPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+}
+
+
+def _insert_implicit_plus(text):
+    """'2 1/2' (whole number, space, fraction, no operator) is the common
+    way people write a mixed number -- treat it as '2 + 1/2'. Text that
+    already has an operator there ('2 + 1/2', '2 - 1/2') is left alone."""
+    return _MIXED_NUMBER_RE.sub(r"\1+\2", text)
+
+
+def _eval_fraction_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_fraction_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return Fraction(str(node.value))
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        return _BINOPS[type(node.op)](_eval_fraction_node(node.left),
+                                       _eval_fraction_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_fraction_node(node.operand)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        return _eval_fraction_node(node.operand)
+    raise ValueError("unsupported expression")
+
+
+def parse_measurement(text):
+    """Parse a measurement expression into an exact fractions.Fraction, or
+    None if it's blank or not a valid one. Supports decimals, fractions,
+    mixed numbers, and +, -, *, / and parentheses -- e.g. '2 + 1/2' and
+    '2 1/2' both parse to Fraction(5, 2)."""
+    if text is None:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    text = _insert_implicit_plus(text)
+    try:
+        tree = ast.parse(text, mode="eval")
+        return _eval_fraction_node(tree)
+    except (SyntaxError, ValueError, ZeroDivisionError, TypeError):
+        return None
+
+
+def looks_like_fraction_input(text):
+    """Whether a measurement string used fraction notation anywhere (a
+    '/') -- used to decide whether an axis's computed lines should
+    default to displaying as fractions too."""
+    return text is not None and "/" in text
+
+
+def format_fraction(value, denominator):
+    """Round a length to the nearest 1/denominator and format it as a
+    mixed number string, whole and fraction joined with a dash so it's
+    unambiguously one number (e.g. 2.53 with denominator=32 -> '2-17/32',
+    not '2 17/32' which can misread as two separate numbers)."""
+    if value is None:
+        return None
+    negative = value < 0
+    value = abs(value)
+    n = round(value * denominator)
+    whole, rem = divmod(n, denominator)
+    if rem == 0:
+        s = f"{whole}"
+    else:
+        g = math.gcd(rem, denominator)
+        rem_r, den_r = rem // g, denominator // g
+        s = f"{rem_r}/{den_r}" if whole == 0 else f"{whole}-{rem_r}/{den_r}"
+    return ("-" if negative else "") + s
+
+
 def _make_x_icon(color, size=9, thickness=1, pad_left=5):
     """A small transparent PhotoImage with an 'X' drawn in it, used for the
     close button on each tab. Built by hand (no external icon file) so the
@@ -163,7 +277,8 @@ class Line:
     _next_id = 1
 
     def __init__(self, color, x1, y1, x2, y2, known_length=None, unit=None,
-                 parallel_to=None):
+                 parallel_to=None, display_mode=None, display_unit=None,
+                 display_denominator=None):
         self.id = Line._next_id
         Line._next_id += 1
         self.color = color            # 'red' | 'green' | 'blue'
@@ -172,6 +287,15 @@ class Line:
         self.known_length = known_length   # real-world length, or None
         self.unit = unit
         self.parallel_to = parallel_to     # id of reference line, or None
+        # Per-line display overrides -- None means "use the axis default /
+        # calibration unit / program-wide Fraction Denominator setting" (see
+        # ProjectTab.effective_display). Independent of known_length: even a
+        # computed (unknown) line can be told to show as a fraction, rounded
+        # to its own nearest denominator, or converted to a different unit,
+        # on its own.
+        self.display_mode = display_mode    # None | 'decimal' | 'fraction'
+        self.display_unit = display_unit    # None | one of UNIT_CHOICES
+        self.display_denominator = display_denominator  # None | one of FRACTION_DENOMINATOR_CHOICES
         # canvas item ids, filled in by the view
         self.canvas_line_id = None
         self.canvas_label_id = None
@@ -191,12 +315,16 @@ class Line:
             "x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2,
             "known_length": self.known_length, "unit": self.unit,
             "parallel_to": self.parallel_to,
+            "display_mode": self.display_mode, "display_unit": self.display_unit,
+            "display_denominator": self.display_denominator,
         }
 
     @classmethod
     def from_dict(cls, d):
         ln = cls(d["color"], d["x1"], d["y1"], d["x2"], d["y2"],
-                  d.get("known_length"), d.get("unit"), d.get("parallel_to"))
+                  d.get("known_length"), d.get("unit"), d.get("parallel_to"),
+                  d.get("display_mode"), d.get("display_unit"),
+                  d.get("display_denominator"))
         ln.id = d["id"]
         Line._next_id = max(Line._next_id, ln.id + 1)
         return ln
@@ -338,6 +466,12 @@ class ProjectTab(ttk.Frame):
                                                   # known-length edit, for Escape to revert to
         self._suppress_next_focus_snapshot = False  # see maybe_start_length_edit /
                                                        # _capture_length_edit_snapshot
+        # Per-axis default DISPLAY mode ('decimal' or 'fraction') for lines
+        # that don't have their own display_mode override. Set automatically
+        # whenever a known length is committed for that color: typing it as
+        # a fraction ("2 1/2", "3/4") switches that axis's other lines to
+        # showing fractions too; typing a plain decimal switches it back.
+        self.axis_display_mode = {color: "decimal" for color in AXIS_COLORS}
 
         self._build_body()
 
@@ -407,10 +541,40 @@ class ProjectTab(ttk.Frame):
         self.known_unit_box.bind("<Return>", self.commit_known_length)
         self.known_unit_box.bind("<FocusIn>", self._capture_length_edit_snapshot)
 
-        ttk.Label(known_frame, text="Type a value and press Enter. Leave blank for "
-                                     "no known length -- nothing is required.",
-                  foreground="#666", wraplength=270, justify="left").pack(
-            anchor="w", pady=(4, 0))
+        # Display override for the selected line -- independent of the known-
+        # length field above: it controls how THIS line's length (known or
+        # computed) is shown, not what its calibration is. "(auto)" means
+        # "use the axis's default" (decimal, unless a fraction was typed
+        # into some line's known length on this axis -- see
+        # commit_known_length) for mode, "the axis's calibration unit" for
+        # unit, and "the program-wide Settings > Fraction Denominator" for
+        # denom -- so most lines never need to touch these at all.
+        display_row = ttk.Frame(known_frame)
+        display_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(display_row, text="Display:").pack(side="left")
+        self.display_mode_var = tk.StringVar(value="(auto)")
+        self.display_mode_box = ttk.Combobox(
+            display_row, textvariable=self.display_mode_var, width=8, state="disabled",
+            values=["(auto)", "decimal", "fraction"])
+        self.display_mode_box.pack(side="left", padx=(4, 0))
+        self.display_mode_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
+
+        self.display_unit_var = tk.StringVar(value="(auto)")
+        self.display_unit_box = ttk.Combobox(
+            display_row, textvariable=self.display_unit_var, width=6, state="disabled",
+            values=["(auto)"] + UNIT_CHOICES)
+        self.display_unit_box.pack(side="left", padx=(4, 0))
+        self.display_unit_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
+
+        denom_row = ttk.Frame(known_frame)
+        denom_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(denom_row, text="Fraction denom:").pack(side="left")
+        self.display_denominator_var = tk.StringVar(value="(auto)")
+        self.display_denominator_box = ttk.Combobox(
+            denom_row, textvariable=self.display_denominator_var, width=8, state="disabled",
+            values=["(auto)"] + [f"1/{d}" for d in FRACTION_DENOMINATOR_CHOICES])
+        self.display_denominator_box.pack(side="left", padx=(4, 0))
+        self.display_denominator_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
 
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
         columns = ("color", "axis", "px", "real", "calib")
@@ -722,13 +886,44 @@ class ProjectTab(ttk.Frame):
 
     def computed_length(self, line):
         """Real-world length for a line: its own known length if set,
-        otherwise derived from its axis's calibration."""
+        otherwise derived from its axis's calibration. Always in whichever
+        unit that calibration used -- see effective_display for a line's
+        own display unit/mode (which may differ)."""
         if line.known_length:
             return line.known_length, line.unit
         upp, unit = self.axis_scale(line.color)
         if upp is None:
             return None, None
         return line.pixel_length() * upp, unit
+
+    def effective_display(self, line):
+        """The (value, unit, mode, denominator) a line should actually be
+        SHOWN with -- computed_length()'s value/unit, converted to this
+        line's own display_unit override if it has one (falling back to
+        the calibration unit if that conversion isn't possible, e.g. px),
+        its display_mode override if it has one (else this axis's current
+        default -- see commit_known_length / axis_display_mode), and its
+        own display_denominator override if it has one (else the
+        program-wide Settings > Fraction Denominator)."""
+        real, calib_unit = self.computed_length(line)
+        if real is None:
+            return None, None, None, None
+        unit = line.display_unit or calib_unit
+        value = convert_length(real, calib_unit, unit)
+        if value is None:
+            unit = calib_unit
+            value = real
+        mode = line.display_mode or self.axis_display_mode.get(line.color, "decimal")
+        denom = line.display_denominator or self.app.fraction_denominator.get()
+        return value, unit, mode, denom
+
+    def format_display(self, value, unit, mode, denom=None):
+        if value is None:
+            return "?"
+        if mode == "fraction":
+            denom = denom or self.app.fraction_denominator.get()
+            return f"{format_fraction(value, denom)} {unit}"
+        return fmt_len(value, unit)
 
     # ------------------------------------------------------------ drawing
     def find_line_near(self, ix, iy, tolerance_img):
@@ -1113,8 +1308,8 @@ class ProjectTab(ttk.Frame):
                                      x + HANDLE_RADIUS, y + HANDLE_RADIUS,
                                      fill=outline, outline="white", tags=("handle",))
 
-        real, unit = self.computed_length(ln)
-        label = f"#{ln.id} {fmt_len(real, unit) if real else '? (uncalibrated)'}"
+        value, unit, mode, denom = self.effective_display(ln)
+        label = f"#{ln.id} {self.format_display(value, unit, mode, denom) if value is not None else '? (uncalibrated)'}"
         if ln.known_length:
             label += " [known]"
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
@@ -1124,11 +1319,11 @@ class ProjectTab(ttk.Frame):
     def _update_tree(self):
         self.tree.delete(*self.tree.get_children())
         for ln in self.lines:
-            real, unit = self.computed_length(ln)
+            value, unit, mode, denom = self.effective_display(ln)
             axis = AXIS_COLORS[ln.color]["axis"]
             self.tree.insert("", "end", iid=str(ln.id), values=(
                 ln.color, axis, f"{ln.pixel_length():.1f}",
-                fmt_len(real, unit) if real else "?",
+                self.format_display(value, unit, mode, denom) if value is not None else "?",
                 "yes" if ln.known_length else "no",
             ))
         # Mirrors self.selected_line_ids back onto the tree widget. This
@@ -1193,14 +1388,47 @@ class ProjectTab(ttk.Frame):
                 self.selection_label.config(
                     text=f"Line #{ln.id} ({ln.color}, {AXIS_COLORS[ln.color]['axis']}) "
                          f"-- {ln.pixel_length():.1f} px")
+                self.display_mode_box.config(state="readonly")
+                self.display_unit_box.config(state="readonly")
+                self.display_denominator_box.config(state="readonly")
+                self.display_mode_var.set(ln.display_mode or "(auto)")
+                self.display_unit_var.set(ln.display_unit or "(auto)")
+                self.display_denominator_var.set(
+                    f"1/{ln.display_denominator}" if ln.display_denominator else "(auto)")
                 return
         self.known_length_var.set("")
         self.known_length_entry.config(state="disabled")
         self.known_unit_box.config(state="disabled")
+        self.display_mode_var.set("(auto)")
+        self.display_unit_var.set("(auto)")
+        self.display_denominator_var.set("(auto)")
+        self.display_mode_box.config(state="disabled")
+        self.display_unit_box.config(state="disabled")
+        self.display_denominator_box.config(state="disabled")
         if len(self.selected_line_ids) == 0:
             self.selection_label.config(text="No line selected")
         else:
             self.selection_label.config(text=f"{len(self.selected_line_ids)} lines selected")
+
+    def commit_display_settings(self, event=None):
+        """Apply the Display mode/unit/denominator combos to the single
+        selected line -- an override independent of its known length, used
+        for both known and computed lines. '(auto)' clears an override
+        (back to the axis default / calibration unit / program-wide
+        Fraction Denominator setting, respectively)."""
+        if len(self.selected_line_ids) != 1:
+            return
+        ln = self._line_by_id(self.selected_line_ids[0])
+        if not ln:
+            return
+        mode = self.display_mode_var.get()
+        unit = self.display_unit_var.get()
+        denom = self.display_denominator_var.get()
+        ln.display_mode = None if mode == "(auto)" else mode
+        ln.display_unit = None if unit == "(auto)" else unit
+        ln.display_denominator = None if denom == "(auto)" else int(denom.split("/")[1])
+        self.mark_dirty()
+        self.redraw()
 
     def commit_known_length(self, event=None):
         """Apply whatever is currently typed in the known-length field to
@@ -1215,16 +1443,27 @@ class ProjectTab(ttk.Frame):
             changed = ln.known_length is not None
             ln.known_length = None
         else:
-            try:
-                value = float(text)
-            except ValueError:
-                self.app.set_status("Known length must be a number (or leave it blank).")
+            parsed = parse_measurement(text)
+            if parsed is None:
+                self.app.set_status(
+                    "Known length must be a number, fraction, mixed number, or simple "
+                    "math (e.g. 2.5, 1/2, 2 1/2, 2 + 1/2) -- or leave it blank.")
                 return
+            value = float(parsed)
             if value <= 0:
                 self.app.set_status("Known length must be greater than 0.")
                 return
             changed = ln.known_length != value
             ln.known_length = value
+            # Typing this known length as a fraction switches this AXIS's
+            # other lines (that don't have their own display override) to
+            # showing fractions by default too; a plain decimal switches
+            # that default back. Only a real edit does this -- reapplying
+            # the same already-committed text (e.g. a stray FocusOut)
+            # shouldn't flip the default back and forth.
+            if changed:
+                self.axis_display_mode[ln.color] = (
+                    "fraction" if looks_like_fraction_input(text) else "decimal")
         ln.unit = self.known_unit_var.get().strip() or self.app.default_unit.get()
         if changed:
             self.mark_dirty()
@@ -1267,12 +1506,19 @@ class ProjectTab(ttk.Frame):
 
         ratio = b.pixel_length() / a.pixel_length() if a.pixel_length() else 0
         b_real = a_real * ratio
+        # Display-only formatting -- b_real/a_unit (the exact decimal values
+        # actually applied below) are unaffected by this.
+        a_mode = a.display_mode or self.axis_display_mode.get(a.color, "decimal")
+        b_mode = b.display_mode or self.axis_display_mode.get(b.color, "decimal")
+        a_denom = a.display_denominator or self.app.fraction_denominator.get()
+        b_denom = b.display_denominator or self.app.fraction_denominator.get()
 
         msg = (
-            f"Line #{a.id} ({a.color}): {a.pixel_length():.1f} px = {fmt_len(a_real, a_unit)}\n"
+            f"Line #{a.id} ({a.color}): {a.pixel_length():.1f} px = "
+            f"{self.format_display(a_real, a_unit, a_mode, a_denom)}\n"
             f"Line #{b.id} ({b.color}): {b.pixel_length():.1f} px\n\n"
             f"Pixel ratio (B/A): {ratio:.4f}\n"
-            f"=> Line #{b.id} is approximately {fmt_len(b_real, a_unit)}"
+            f"=> Line #{b.id} is approximately {self.format_display(b_real, a_unit, b_mode, b_denom)}"
         )
         if messagebox.askyesno("Comparison result", msg + "\n\nApply this as line "
                                 f"#{b.id}'s known length?"):
@@ -1323,6 +1569,7 @@ class ProjectTab(ttk.Frame):
             "image_data": image_data_b64,
             "rotation_turns": self.rotation_turns,
             "lines": [ln.to_dict() for ln in self.lines],
+            "axis_display_mode": self.axis_display_mode,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -1386,6 +1633,9 @@ class ProjectTab(ttk.Frame):
         self.lines = [Line.from_dict(d) for d in data.get("lines", [])]
         self.selected_line_ids = []
         self.project_path = path
+        saved_modes = data.get("axis_display_mode") or {}
+        self.axis_display_mode = {
+            color: saved_modes.get(color, "decimal") for color in AXIS_COLORS}
         self.dirty = False
         self.app.update_tab_title(self)
         self.fit_to_window()
@@ -1407,14 +1657,16 @@ class ProjectTab(ttk.Frame):
             w = csv.writer(f)
             w.writerow(["id", "color", "axis", "x1", "y1", "x2", "y2",
                         "pixel_length", "known_length", "unit",
-                        "computed_length", "parallel_to"])
+                        "computed_length", "displayed_length", "parallel_to"])
             for ln in self.lines:
                 real, unit = self.computed_length(ln)
+                value, disp_unit, mode, denom = self.effective_display(ln)
                 w.writerow([ln.id, ln.color, AXIS_COLORS[ln.color]["axis"],
                             f"{ln.x1:.2f}", f"{ln.y1:.2f}", f"{ln.x2:.2f}", f"{ln.y2:.2f}",
                             f"{ln.pixel_length():.2f}",
                             ln.known_length if ln.known_length else "",
                             ln.unit or "", f"{real:.4f}" if real else "",
+                            self.format_display(value, disp_unit, mode, denom) if value is not None else "",
                             ln.parallel_to or ""])
         self.app.set_status(f"Exported {len(self.lines)} lines to {path}")
 
@@ -1430,6 +1682,7 @@ class ProjectTab(ttk.Frame):
             "view_x": self.view_x,
             "view_y": self.view_y,
             "lines": [ln.to_dict() for ln in self.lines],
+            "axis_display_mode": self.axis_display_mode,
         }
 
 
@@ -1452,6 +1705,11 @@ class App:
         # the last line used" -- so one line measured in an odd unit doesn't
         # silently become the default for everything drawn after it.
         self.default_unit = tk.StringVar(value=DEFAULT_UNIT)
+        # How finely a "fraction" display rounds (Settings menu), program-
+        # wide -- e.g. 32 means "nearest 1/32". Affects every line currently
+        # showing in fraction mode, on every open tab.
+        self.fraction_denominator = tk.IntVar(value=DEFAULT_FRACTION_DENOMINATOR)
+        self.fraction_denominator.trace_add("write", self._on_fraction_denominator_change)
 
         self._build_menu()
         self._build_toolbar()
@@ -1519,6 +1777,11 @@ class App:
         for unit in UNIT_CHOICES:
             unitmenu.add_radiobutton(label=unit, variable=self.default_unit, value=unit)
         settingsmenu.add_cascade(label="Default Unit", menu=unitmenu)
+        denommenu = tk.Menu(settingsmenu, tearoff=0)
+        for denom in FRACTION_DENOMINATOR_CHOICES:
+            denommenu.add_radiobutton(label=f"Nearest 1/{denom}", variable=self.fraction_denominator,
+                                       value=denom)
+        settingsmenu.add_cascade(label="Fraction Denominator", menu=denommenu)
         menubar.add_cascade(label="Settings", menu=settingsmenu)
 
         helpmenu = tk.Menu(menubar, tearoff=0)
@@ -1659,19 +1922,31 @@ class App:
             "4. Once one line of a color has a known length, every other line of "
             "that same color shows a computed real-world length automatically -- "
             "shown on the canvas and in the side list.\n"
-            "5. 'Compare 2 Lines' lets you compare any two lines directly "
+            "5. The known-length field understands fractions and simple math, "
+            "not just plain decimals: 1/2, 2 1/2 (a mixed number -- no + needed), "
+            "2 + 1/2, and 3/4 - 1/8 all work. Typing a fraction there switches "
+            "that AXIS's other lines to displaying as fractions too, rounded to "
+            "the nearest 1/32 by default (Settings > Fraction Denominator sets "
+            "that program-wide). The 'Display' row below it overrides just the "
+            "SELECTED line -- decimal vs. fraction, a different unit (e.g. show "
+            "a line as decimal mm even though its axis was calibrated in "
+            "fractional inches), and/or its OWN nearest-fraction denominator "
+            "regardless of the program-wide setting -- independent of every "
+            "other line, and independent of whether that line has its own "
+            "known length or is only computed from the axis.\n"
+            "6. 'Compare 2 Lines' lets you compare any two lines directly "
             "(they don't need to be the same color), even without calibrating "
             "a whole axis.\n"
-            "6. Hold Shift while drawing a new line to lock its direction "
+            "7. Hold Shift while drawing a new line to lock its direction "
             "parallel to the selected line (or the last line drawn).\n"
-            "7. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
+            "8. 'Rotate 90°' rotates the photo a quarter turn clockwise and keeps "
             "every line attached to the same spot on the image.\n"
-            "8. Save Project keeps one tab's image (a full copy, not just its "
+            "9. Save Project keeps one tab's image (a full copy, not just its "
             "path), rotation, and lines in a single .imt file you can reopen "
             "later -- even if the photo has since moved or is on another "
             "computer. Export CSV for a spreadsheet of measurements.\n"
-            "9. The whole window -- every open tab, saved or not -- is remembered "
-            "automatically and restored next time you launch the app."
+            "10. The whole window -- every open tab, saved or not -- is "
+            "remembered automatically and restored next time you launch the app."
         ))
 
     # -------------------------------------------------------------- tabs
@@ -1729,6 +2004,13 @@ class App:
         tab = self.active_tab()
         if tab:
             tab.on_mode_changed()
+
+    def _on_fraction_denominator_change(self, *args):
+        # Every open tab may have lines currently shown as fractions, not
+        # just the active one -- redraw all of them so the new rounding
+        # takes effect everywhere at once.
+        for tab in self._all_tabs():
+            tab.redraw()
 
     def _on_tab_key(self, event, direction=1):
         tab = self.active_tab()
@@ -1854,7 +2136,8 @@ class App:
             tabs_data = [t.snapshot() for t in tabs]
             active = self.notebook.index(self.notebook.select()) if tabs else 0
             data = {"version": 1, "active_index": active, "tabs": tabs_data,
-                    "default_unit": self.default_unit.get()}
+                    "default_unit": self.default_unit.get(),
+                    "fraction_denominator": self.fraction_denominator.get()}
             os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
             tmp = SESSION_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1874,6 +2157,8 @@ class App:
 
         if data.get("default_unit") in UNIT_CHOICES:
             self.default_unit.set(data["default_unit"])
+        if data.get("fraction_denominator") in FRACTION_DENOMINATOR_CHOICES:
+            self.fraction_denominator.set(data["fraction_denominator"])
 
         restored_any = False
         notes = []
@@ -1913,6 +2198,9 @@ class App:
                 tab.project_path = project_path
                 tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
                 tab.selected_line_ids = []
+                saved_modes = entry.get("axis_display_mode") or {}
+                tab.axis_display_mode = {
+                    color: saved_modes.get(color, "decimal") for color in AXIS_COLORS}
                 if entry.get("scale"):
                     tab.scale = entry["scale"]
                     tab.view_x = entry.get("view_x", tab.view_x)
