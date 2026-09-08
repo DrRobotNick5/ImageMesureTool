@@ -234,40 +234,40 @@ If you want a project to survive on its own regardless, use Save Project.
     drag past the usual click threshold still finalizes immediately on
     release, same as before -- this is only for a genuine short click.
 - **Circles** (a 4th, "orange" line type): pick **Circle** mode and click 3
-  points -- the center, then a point on the circumference, then a 2nd point
-  on the circumference in a *different* direction (it doesn't need to be a
-  right angle from the 1st one). This draws an ellipse -- a circle seen at
+  points -- the center first, then 2 points on the rim in *clearly
+  different* directions from it (the 2nd doesn't need to be a right angle
+  from the 1st). A dashed preview follows your cursor as you aim each
+  point. That 3rd click finishes it: an ellipse -- a circle seen at
   whatever perspective the photo shows it from -- plus its 2 diameter
-  **lines**, each running the full width of the circle through the center.
-  Both start out **orange**, a 4th line color that (unlike Red/Green/Blue)
-  isn't a measurement axis on its own -- it just marks "this diameter isn't
-  assigned to an axis yet."
-    - **Reshaping**: Shift-drag any of the ellipse's 4 defining points (the
-      2 diameter lines' 4 endpoints) to move it freely -- the point directly
-      opposite it (through the center, on the same line) mirrors
-      automatically, and the ellipse's shape updates to match. This is how
-      you fit the ellipse to what's actually in the photo.
+  **lines**, each running from the center out to one of the 2 rim points
+  and mirrored exactly through the center to its opposite side. Both start
+  out **orange**, a 4th line color that (unlike Red/Green/Blue) isn't a
+  measurement axis on its own -- it just marks "not assigned to an axis
+  yet."
+    - **Reshaping**: Shift-drag either endpoint of a diameter line to move
+      it freely -- that point moves, its mirrored opposite end (through the
+      center) follows automatically, and the ellipse's shape is recomputed
+      from the result. This is how you fit the ellipse to what's actually
+      in the photo.
     - **Rotating**: Ctrl+Shift-drag a diameter endpoint instead to *rotate*
-      it -- this slides the point around the ellipse's current (already-
-      fixed) boundary instead of reshaping it, so the circle's size/shape
-      never changes, only where its 2 diameters point. **Make Parallel**
-      does the same thing to a diameter line: it rotates within the fixed
-      ellipse to match the reference direction, rather than pivoting freely
-      like an ordinary line would (which would pull it off the circle).
+      it -- this slides just that point (and its mirrored opposite) around
+      the ellipse's current (already-fixed) boundary, so the circle's
+      size/shape never changes, only where that diameter sits on it.
+      **Make Parallel** does the same thing to a diameter line: it rotates
+      it around the fixed ellipse's boundary into the reference direction,
+      rather than pivoting freely like an ordinary line would (which would
+      pull it off the circle).
     - **Moving the whole circle**: Shift-drag the ellipse's own curve
       (not one of the 2 straight diameter lines) to translate the entire
       thing -- center and all 4 points together, shape unchanged.
-    - **Known size and axis assignment**: select one of a circle's diameter
-      lines and the **Circle** panel (below the known-length field) shows
-      buttons to assign that line to a real axis (Red/Green/Blue) -- or
-      back to orange/unassigned -- plus a field for the circle's own known
-      radius or diameter. Once a diameter is assigned to an axis, that
-      known radius/diameter (doubled, if you entered a radius) becomes
-      *that line's* known length automatically, calibrating the axis just
-      like typing a known length in directly. It stays fully movable,
-      reshapable, and rotatable afterward, same as any other line.
-      Reassigning it (to a different axis, or back to orange) clears that
-      known length, since it no longer means the same thing.
+    - **Color and known length -- same as any other line**: there's no
+      separate circle panel. Select one of a circle's diameter lines and
+      the usual known-length panel's **Color** row lets you assign it to a
+      real axis (Red/Green/Blue) or back to orange, exactly like any other
+      line. Typing a known length into either of a circle's 2 diameter
+      lines automatically copies that same value (and unit) onto the
+      *other* diameter line too, since they're 2 measurements of the same
+      circle -- whichever one you edit, the other follows.
     - Deleting either of a circle's 2 diameter lines deletes the whole
       circle. Undo/redo, Save Project, and Snap Mode (below) all cover
       circles the same way they cover ordinary lines.

@@ -85,9 +85,10 @@ DEFAULT_COLOR = "red"
 # Orange is a 4th line color, but NOT a 4th measurement axis -- it's never
 # in AXIS_COLORS (so it never appears in the Red/Green/Blue draw-color
 # picker or the Tab-cycles-color rotation) and never a target for known-
-# length axis calibration on its own. It marks a Circle's 2 diameter
-# lines for as long as they're not yet assigned to a real axis -- see
-# Ellipse / ProjectTab.assign_diameter_axis.
+# length axis calibration on its own. It's selectable for any line via
+# the known-length panel's Color row (see ProjectTab.set_line_color), and
+# is what a Circle's 2 diameter lines start out as before being assigned
+# to a real axis.
 ORANGE_COLOR = "orange"
 ORANGE_META = {"axis": None, "hex": "#fb8c00", "select_hex": "#ffcc80"}
 
@@ -456,10 +457,14 @@ class Ellipse:
     diameters (each stored as a Line whose 2 endpoints are always kept
     exactly opposite the center -- see ProjectTab.mirror_diameter_endpoint).
     line_a_id/line_b_id point at those 2 Lines by id; the Lines themselves
-    carry the color (orange until axis-assigned) and are what render, get
-    selected, deleted, etc. -- Ellipse itself only tracks the shared center,
-    the circle's own known radius/diameter (if the user gave one), and its
-    CURRENT SHAPE.
+    carry the color (orange until reassigned to an axis -- see
+    ProjectTab.set_line_color, which works the same for any line, not
+    just a circle's), their own known_length, and are what render, get
+    selected, deleted, etc. -- Ellipse itself only tracks the shared
+    center and its CURRENT SHAPE. There's no separate "circle known
+    size" anymore: the 2 diameter lines are simply kept linked to the
+    SAME known_length/unit as each other (see ProjectTab.commit_known_length),
+    the same as any other measured property of the line.
 
     The shape (semi_a, semi_b, phi -- see ellipse_canonical) is stored here,
     not re-derived live from the 2 lines on every call. That distinction
@@ -480,44 +485,30 @@ class Ellipse:
     ellipse translate, which don't change it), is what makes "rotate one
     diameter without disturbing the other, or the circle's boundary"
     actually hold.
-
-    known_value/known_is_diameter/known_unit describe a real-world size for
-    the CIRCLE (not yet tied to any axis) -- see ProjectTab.assign_diameter_axis,
-    which is what turns this into a known_length on whichever diameter Line
-    gets assigned to a real (red/green/blue) axis.
     """
 
     _next_id = 1
 
-    def __init__(self, cx, cy, line_a_id, line_b_id, known_value=None,
-                 known_is_diameter=True, known_unit=None,
+    def __init__(self, cx, cy, line_a_id, line_b_id,
                  semi_a=0.0, semi_b=0.0, phi=0.0):
         self.id = Ellipse._next_id
         Ellipse._next_id += 1
         self.cx, self.cy = cx, cy
         self.line_a_id = line_a_id
         self.line_b_id = line_b_id
-        self.known_value = known_value        # radius or diameter, or None
-        self.known_is_diameter = known_is_diameter
-        self.known_unit = known_unit
         self.semi_a, self.semi_b, self.phi = semi_a, semi_b, phi
 
     def to_dict(self):
         return {
             "id": self.id, "cx": self.cx, "cy": self.cy,
             "line_a_id": self.line_a_id, "line_b_id": self.line_b_id,
-            "known_value": self.known_value,
-            "known_is_diameter": self.known_is_diameter,
-            "known_unit": self.known_unit,
             "semi_a": self.semi_a, "semi_b": self.semi_b, "phi": self.phi,
         }
 
     @classmethod
     def from_dict(cls, d):
         el = cls(d["cx"], d["cy"], d["line_a_id"], d["line_b_id"],
-                  d.get("known_value"), d.get("known_is_diameter", True),
-                  d.get("known_unit"), d.get("semi_a", 0.0), d.get("semi_b", 0.0),
-                  d.get("phi", 0.0))
+                  d.get("semi_a", 0.0), d.get("semi_b", 0.0), d.get("phi", 0.0))
         el.id = d["id"]
         Ellipse._next_id = max(Ellipse._next_id, el.id + 1)
         return el
@@ -753,17 +744,89 @@ class ProjectTab(ttk.Frame):
 
     # ---------------------------------------------------------- UI setup
     def _build_body(self):
-        # side panel: known-length field + line list (on the LEFT)
-        side = ttk.Frame(self, padding=6, width=300)
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
+        # The side panel (options + line list, on the LEFT) and the image
+        # canvas sit in a horizontal PanedWindow so the divider between
+        # them can be dragged to resize the side panel -- plain side-by-
+        # side .pack() calls (the old layout) can't do that; a sash can.
+        # canvas_frame gets stretch="always" so widening/narrowing the
+        # whole window grows/shrinks the CANVAS side, leaving whatever
+        # width you dragged the side panel to alone.
+        paned = tk.PanedWindow(self, orient="horizontal", sashwidth=6,
+                                sashrelief="raised", bg="#c0c0c0",
+                                bd=0, opaqueresize=True)
+        paned.pack(fill="both", expand=True)
 
-        # canvas (fills the rest of the tab). No scrollbars -- panning is
-        # done by dragging with the middle mouse button, and only the
-        # visible region is ever rendered (see _render_image), which is
-        # what keeps zooming in on a big photo from lagging.
-        canvas_frame = ttk.Frame(self)
-        canvas_frame.pack(side="left", fill="both", expand=True)
+        # The side panel's actual content (known-length field, Circle
+        # panel, line list, axis calibration) is built inside `side`, same
+        # as before -- but `side` now lives inside a Canvas+Scrollbar so
+        # that if the window is too short for everything to fit, a
+        # vertical scrollbar appears instead of clipping/squashing the
+        # bottom of the panel. See _on_side_frame_configure /
+        # _on_side_canvas_configure below for how the scrollregion and
+        # inner-frame width are kept in sync.
+        side_outer = ttk.Frame(paned)
+        paned.add(side_outer, width=300, minsize=180)
+
+        # A plain tk.Canvas defaults to a white background, which stands
+        # out against the rest of the (themed, tan/gray) UI -- match
+        # whatever the ttk theme actually uses for an ordinary frame so
+        # the wrapper is invisible when nothing needs to scroll.
+        themed_bg = ttk.Style().lookup("TFrame", "background") or side_outer.cget("background")
+        side_canvas = tk.Canvas(side_outer, highlightthickness=0, bg=themed_bg)
+        side_scrollbar = ttk.Scrollbar(side_outer, orient="vertical",
+                                        command=side_canvas.yview)
+        side_canvas.configure(yscrollcommand=side_scrollbar.set)
+        # The scrollbar itself is only packed once content actually
+        # overflows the visible height (see _update_side_scrollbar) --
+        # it starts unpacked so a tall-enough window never shows one.
+        side_canvas.pack(side="left", fill="both", expand=True)
+
+        side = ttk.Frame(side_canvas, padding=6)
+        side_window = side_canvas.create_window((0, 0), window=side, anchor="nw")
+
+        self._side_scrollbar_visible = False
+
+        def _update_side_scrollbar():
+            bbox = side_canvas.bbox("all")
+            content_h = bbox[3] - bbox[1] if bbox else 0
+            needed = content_h > side_canvas.winfo_height()
+            if needed and not self._side_scrollbar_visible:
+                side_scrollbar.pack(side="right", fill="y")
+                self._side_scrollbar_visible = True
+            elif not needed and self._side_scrollbar_visible:
+                side_scrollbar.pack_forget()
+                self._side_scrollbar_visible = False
+
+        def _on_side_frame_configure(event):
+            side_canvas.configure(scrollregion=side_canvas.bbox("all"))
+            _update_side_scrollbar()
+        side.bind("<Configure>", _on_side_frame_configure)
+
+        def _on_side_canvas_configure(event):
+            # Keep the inner frame exactly as wide as the canvas viewport
+            # so its widgets (comboboxes, buttons, ...) fill it properly
+            # instead of staying whatever width they'd shrink to on their
+            # own -- only the height is ever meant to scroll.
+            side_canvas.itemconfig(side_window, width=event.width)
+            _update_side_scrollbar()
+        side_canvas.bind("<Configure>", _on_side_canvas_configure)
+
+        def _on_side_mousewheel(event):
+            if self._side_scrollbar_visible:
+                side_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # Only scrolls with the wheel while the cursor is actually over the
+        # side panel (bind_all while entered, unbind_all on leave) so
+        # scrolling over the canvas/image is never hijacked by this; the
+        # handler itself is a no-op whenever there's nothing to scroll.
+        side_canvas.bind("<Enter>", lambda e: side_canvas.bind_all("<MouseWheel>", _on_side_mousewheel))
+        side_canvas.bind("<Leave>", lambda e: side_canvas.unbind_all("<MouseWheel>"))
+
+        # canvas (fills the rest of the tab). No scrollbars of its own --
+        # panning is done by dragging with the middle mouse button, and
+        # only the visible region is ever rendered (see _render_image),
+        # which is what keeps zooming in on a big photo from lagging.
+        canvas_frame = ttk.Frame(paned)
+        paned.add(canvas_frame, minsize=300, stretch="always")
 
         self.canvas = tk.Canvas(canvas_frame, bg="#2b2b2b", cursor="crosshair",
                                  highlightthickness=0)
@@ -817,6 +880,34 @@ class ProjectTab(ttk.Frame):
         self.known_unit_box.bind("<Return>", self.commit_known_length)
         self.known_unit_box.bind("<FocusIn>", self._capture_length_edit_snapshot)
 
+        # Color/axis for the selected line -- ANY line can be reassigned
+        # here, not just a circle's diameter lines (that used to be a
+        # separate, circle-only "Circle panel"; recoloring is now just a
+        # normal property of any line, same as its known length). Orange
+        # means "not on a measurement axis yet" (see ORANGE_COLOR) --
+        # meaningful for a circle's diameter lines, which start out
+        # orange until assigned, but selectable for any line. See
+        # commit_line_color / set_line_color.
+        color_row = ttk.Frame(known_frame)
+        color_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(color_row, text="Color:").pack(side="left")
+        self.line_color_var = tk.StringVar(value=ORANGE_COLOR)
+        self.line_color_buttons = {}
+        for color in (ORANGE_COLOR,) + tuple(AXIS_COLORS.keys()):
+            meta = line_color_meta(color)
+            # Just "none" / the axis letter -- the button's own background
+            # color already shows which color this is, so repeating the
+            # color name in the label too would just make these buttons
+            # wider than they need to be.
+            label = "none" if color == ORANGE_COLOR else meta["axis"]
+            btn = tk.Radiobutton(
+                color_row, text=label, variable=self.line_color_var, value=color,
+                indicatoron=False, fg="white", bg=meta["hex"], selectcolor=meta["hex"],
+                activebackground=meta["select_hex"], state="disabled",
+                command=self.commit_line_color)
+            btn.pack(side="left", padx=2)
+            self.line_color_buttons[color] = btn
+
         # Display override for the selected line -- independent of the known-
         # length field above: it controls how THIS line's length (known or
         # computed) is shown, not what its calibration is. "(auto)" means
@@ -856,61 +947,6 @@ class ProjectTab(ttk.Frame):
         self.display_denominator_box.pack(side="left", padx=(4, 0))
         self.display_denominator_box.bind("<<ComboboxSelected>>", self.commit_display_settings)
         self._denom_row_visible = True
-
-        # --- Circle panel: only meaningful when the selected line is one of
-        # a Circle's 2 diameter lines. Axis assignment moves it out of
-        # orange (unassigned) onto a real measurement axis, which is what
-        # turns the circle's own known radius/diameter (below) into that
-        # line's actual known_length -- see assign_diameter_axis. The
-        # known radius/diameter itself belongs to the CIRCLE, not to either
-        # line individually, so it's set once here and propagates to
-        # whichever line(s) are already axis-assigned -- see
-        # commit_circle_known_value.
-        circle_frame = ttk.LabelFrame(side, text="Circle (selected diameter line)", padding=6)
-        circle_frame.pack(fill="x", pady=(0, 8))
-        self.circle_selection_label = ttk.Label(
-            circle_frame, text="No circle line selected", foreground="#555")
-        self.circle_selection_label.pack(anchor="w")
-
-        axis_assign_row = ttk.Frame(circle_frame)
-        axis_assign_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(axis_assign_row, text="Axis:").pack(side="left")
-        self.circle_axis_var = tk.StringVar(value=ORANGE_COLOR)
-        self.circle_axis_buttons = {}
-        for color in (ORANGE_COLOR,) + tuple(AXIS_COLORS.keys()):
-            meta = line_color_meta(color)
-            label = "none (orange)" if color == ORANGE_COLOR else f"{meta['axis']} ({color})"
-            btn = tk.Radiobutton(
-                axis_assign_row, text=label, variable=self.circle_axis_var, value=color,
-                indicatoron=False, fg="white", bg=meta["hex"], selectcolor=meta["hex"],
-                activebackground=meta["select_hex"], state="disabled",
-                command=self.commit_circle_axis)
-            btn.pack(side="left", padx=2)
-            self.circle_axis_buttons[color] = btn
-
-        known_circle_row = ttk.Frame(circle_frame)
-        known_circle_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(known_circle_row, text="Known:").pack(side="left")
-        self.circle_known_var = tk.StringVar(value="")
-        self.circle_known_entry = ttk.Entry(
-            known_circle_row, textvariable=self.circle_known_var, width=10, state="disabled")
-        self.circle_known_entry.pack(side="left", padx=(4, 0))
-        self.circle_known_entry.bind("<Return>", self.commit_circle_known_value)
-        self.circle_known_entry.bind("<FocusOut>", self.commit_circle_known_value)
-
-        self.circle_known_unit_var = tk.StringVar(value=DEFAULT_UNIT)
-        self.circle_known_unit_box = ttk.Combobox(
-            known_circle_row, textvariable=self.circle_known_unit_var, width=6,
-            state="disabled", values=UNIT_CHOICES)
-        self.circle_known_unit_box.pack(side="left", padx=(4, 0))
-        self.circle_known_unit_box.bind("<<ComboboxSelected>>", self.commit_circle_known_value)
-
-        self.circle_known_is_diameter_var = tk.StringVar(value="diameter")
-        self.circle_known_kind_box = ttk.Combobox(
-            known_circle_row, textvariable=self.circle_known_is_diameter_var, width=9,
-            state="disabled", values=["diameter", "radius"])
-        self.circle_known_kind_box.pack(side="left", padx=(4, 0))
-        self.circle_known_kind_box.bind("<<ComboboxSelected>>", self.commit_circle_known_value)
 
         ttk.Label(side, text="Measured lines", font=("", 10, "bold")).pack(anchor="w")
         columns = ("color", "axis", "px", "real", "calib")
@@ -2402,9 +2438,11 @@ class ProjectTab(ttk.Frame):
         """Escape either reverts an in-progress known-length edit back to
         its pre-edit value (if that field has focus), cancels an in-
         progress Make Parallel pick, cancels a vertex that's mid-follow
-        after a Shift+click pickup, or -- otherwise -- cancels a line that
-        was started with a short click and is waiting for its closing
-        click."""
+        after a Shift+click pickup, cancels a circle that's mid-click, or
+        cancels a line that was started with a short click and is waiting
+        for its closing click -- whichever of those is actually in
+        progress. Otherwise, if nothing is in progress but one or more
+        lines are selected, Escape just clears that selection."""
         focused = self.app.root.focus_get()
         if focused in (self.known_length_entry, self.known_unit_box):
             self.cancel_length_edit()
@@ -2419,7 +2457,12 @@ class ProjectTab(ttk.Frame):
         if self.circle_points:
             self.cancel_circle()
             return
-        self.cancel_click_draw()
+        if self.click_draw_start is not None:
+            self.cancel_click_draw()
+            return
+        if self.selected_line_ids:
+            self.select_line(None)
+            self.app.set_status("Selection cleared.")
 
     # -------------------------------------------------------------- redraw
     def redraw(self):
@@ -2580,7 +2623,9 @@ class ProjectTab(ttk.Frame):
                 self.display_denominator_var.set(
                     f"1/{ln.display_denominator}" if ln.display_denominator else "(auto)")
                 self._update_denom_row_visibility(ln)
-                self._update_circle_panel(ln)
+                for btn in self.line_color_buttons.values():
+                    btn.config(state="normal")
+                self.line_color_var.set(ln.color)
                 return
         self.known_length_var.set("")
         self.known_length_entry.config(state="disabled")
@@ -2592,128 +2637,43 @@ class ProjectTab(ttk.Frame):
         self.display_unit_box.config(state="disabled")
         self.display_denominator_box.config(state="disabled")
         self._update_denom_row_visibility(None)
-        self._update_circle_panel(None)
+        for btn in self.line_color_buttons.values():
+            btn.config(state="disabled")
         if len(self.selected_line_ids) == 0:
             self.selection_label.config(text="No line selected")
         else:
             self.selection_label.config(text=f"{len(self.selected_line_ids)} lines selected")
 
-    def _update_circle_panel(self, ln):
-        """Refresh the Circle panel (axis-assignment buttons + known
-        radius/diameter field) for `ln` -- the single selected line, or
-        None. Enabled only when `ln` is one of a Circle's 2 diameter
-        lines (see ellipse_for_line)."""
-        ellipse = self.ellipse_for_line(ln.id) if ln else None
-        if ellipse is None:
-            for btn in self.circle_axis_buttons.values():
-                btn.config(state="disabled")
-            self.circle_known_entry.config(state="disabled")
-            self.circle_known_unit_box.config(state="disabled")
-            self.circle_known_kind_box.config(state="disabled")
-            self.circle_selection_label.config(text="No circle line selected")
-            return
-        for btn in self.circle_axis_buttons.values():
-            btn.config(state="normal")
-        self.circle_axis_var.set(ln.color)
-        self.circle_known_entry.config(state="normal")
-        self.circle_known_unit_box.config(state="readonly")
-        self.circle_known_kind_box.config(state="readonly")
-        self.circle_known_var.set(
-            "" if ellipse.known_value is None else str(ellipse.known_value))
-        self.circle_known_unit_var.set(ellipse.known_unit or self.app.default_unit.get())
-        self.circle_known_is_diameter_var.set(
-            "diameter" if ellipse.known_is_diameter else "radius")
-        self.circle_selection_label.config(
-            text=f"Circle #{ellipse.id} -- line #{ln.id} is its {ln.color} diameter")
-
-    def commit_circle_axis(self):
-        """Radiobutton in the Circle panel: reassign the selected diameter
-        line's color/axis. See assign_diameter_axis."""
-        if len(self.selected_line_ids) != 1:
-            return
-        ln = self._line_by_id(self.selected_line_ids[0])
-        if not ln or not self.ellipse_for_line(ln.id):
-            return
-        self.assign_diameter_axis(ln, self.circle_axis_var.get())
-
-    def assign_diameter_axis(self, line, new_color):
-        """Change a Circle diameter line's color -- from orange
-        (unassigned) onto a real measurement axis (red/green/blue), back
-        to orange, or between axes. Stays fully movable/rotatable
-        afterward, same as any other line. Assigning a real axis is what
-        turns the circle's own known radius/diameter (Ellipse.known_value,
-        set in the panel below) into THIS line's actual known_length --
-        e.g. 'this diameter is now the X axis, and the circle is 2 inches
-        across'. Moving it off an axis (back to orange, or onto a
-        different one) clears whatever known_length that assignment gave
-        it, since it no longer means what it used to."""
-        if line.color == new_color:
-            return
-        ellipse = self.ellipse_for_line(line.id)
-        self._push_undo()
-        line.color = new_color
-        if new_color != ORANGE_COLOR and ellipse and ellipse.known_value is not None:
-            line.known_length = (ellipse.known_value if ellipse.known_is_diameter
-                                  else ellipse.known_value * 2)
-            line.unit = ellipse.known_unit
-        else:
-            line.known_length = None
-            line.unit = None
-        self.mark_dirty()
-        self.redraw()
-        self.populate_known_length_field()
-        self.app.set_status(
-            f"Line #{line.id} is now {'unassigned (orange)' if new_color == ORANGE_COLOR else new_color}.")
-
-    def commit_circle_known_value(self, event=None):
-        """The Circle panel's known radius/diameter field: a real-world
-        size for the WHOLE circle (not either line individually -- see the
-        panel's docstring above). Propagates to whichever of its 2
-        diameter lines are already axis-assigned."""
+    def commit_line_color(self):
+        """Radiobutton in the known-length panel: reassign the selected
+        line's color/axis. See set_line_color."""
         if len(self.selected_line_ids) != 1:
             return
         ln = self._line_by_id(self.selected_line_ids[0])
         if not ln:
             return
-        ellipse = self.ellipse_for_line(ln.id)
-        if not ellipse:
+        self.set_line_color(ln, self.line_color_var.get())
+
+    def set_line_color(self, line, new_color):
+        """Change ANY line's color/axis -- from orange (no axis) onto a
+        real measurement axis (red/green/blue), back to orange, or between
+        axes. Works the same for an ordinary line and a circle's diameter
+        line; stays fully movable/rotatable/reshapable afterward either
+        way. The line's own known_length (if it has one) is left exactly
+        as it was -- recoloring doesn't change what the line itself
+        measures, only which axis it calibrates. If this line is one of a
+        Circle's 2 diameters, see _draw_ellipse for how the circle's own
+        outline color follows its 2 lines' colors -- nothing else about
+        the circle changes here."""
+        if line.color == new_color:
             return
-        text = self.circle_known_var.get().strip()
-        new_unit = self.circle_known_unit_var.get().strip() or self.app.default_unit.get()
-        is_diameter = self.circle_known_is_diameter_var.get() != "radius"
-        if text == "":
-            new_value = None
-        else:
-            parsed = parse_measurement(text)
-            if parsed is None:
-                self.app.set_status(
-                    "Circle's known radius/diameter must be a number, fraction, "
-                    "mixed number, or simple math (e.g. 2.5, 1/2, 2 1/2) -- or blank.")
-                return
-            new_value = float(parsed)
-            if new_value <= 0:
-                self.app.set_status("Circle's known radius/diameter must be greater than 0.")
-                return
-        changed = (ellipse.known_value != new_value or ellipse.known_unit != new_unit
-                   or ellipse.known_is_diameter != is_diameter)
-        if changed:
-            self._push_undo()
-        ellipse.known_value = new_value
-        ellipse.known_unit = new_unit
-        ellipse.known_is_diameter = is_diameter
-        for lid in (ellipse.line_a_id, ellipse.line_b_id):
-            other = self._line_by_id(lid)
-            if other and other.color != ORANGE_COLOR:
-                if new_value is None:
-                    other.known_length = None
-                    other.unit = None
-                else:
-                    other.known_length = new_value if is_diameter else new_value * 2
-                    other.unit = new_unit
-        if changed:
-            self.mark_dirty()
+        self._push_undo()
+        line.color = new_color
+        self.mark_dirty()
         self.redraw()
         self.populate_known_length_field()
+        self.app.set_status(
+            f"Line #{line.id} is now {'unassigned (orange)' if new_color == ORANGE_COLOR else new_color}.")
 
     def commit_display_settings(self, event=None):
         """Apply the Display mode/unit/denominator combos to the single
@@ -2783,6 +2743,19 @@ class ProjectTab(ttk.Frame):
         # specific line (an explicit, visible override) -- nothing hidden
         # in between.
         ln.unit = new_unit
+        # If this line is one of a Circle's 2 diameters, the OTHER one is
+        # a measurement of the exact same physical distance (both are
+        # diameters of the same circle), so it's kept linked to the same
+        # known_length/unit -- whichever of the 2 you type a known length
+        # into, the other one just follows.
+        ellipse = self.ellipse_for_line(ln.id)
+        if ellipse:
+            other_id = (ellipse.line_b_id if ln.id == ellipse.line_a_id
+                        else ellipse.line_a_id)
+            other = self._line_by_id(other_id)
+            if other:
+                other.known_length = new_value
+                other.unit = new_unit
         if changed:
             self.mark_dirty()
         self.redraw()
@@ -3015,6 +2988,7 @@ class ProjectTab(ttk.Frame):
             "view_x": self.view_x,
             "view_y": self.view_y,
             "lines": [ln.to_dict() for ln in self.lines],
+            "ellipses": [el.to_dict() for el in self.ellipses],
             "axis_display_mode": self.axis_display_mode,
         }
 
@@ -3364,18 +3338,27 @@ class App:
             "directions -- the 2nd point doesn't need to be a right angle from "
             "the 1st, any 2 different directions work. This makes an ellipse "
             "plus its 2 diameter LINES (shown in orange, a 4th color that isn't "
-            "a measurement axis until you assign one). Shift-drag a diameter "
-            "endpoint to reshape the ellipse; Ctrl+Shift-drag one instead to "
-            "ROTATE it -- slide it around the circle's already-fixed boundary "
-            "without changing the circle's shape (Make Parallel does this too, "
-            "for a diameter line). Shift-drag the circle's own curve (not "
-            "either diameter line) to move the whole thing. The Circle panel "
-            "(under the known-length field, when a diameter line is selected) "
-            "assigns that line to a real axis (Red/Green/Blue) or back to "
-            "orange, and sets the circle's own known radius or diameter -- "
-            "once assigned to an axis, that becomes the line's known length, "
-            "same as typing one in directly. Snap Mode also pulls onto a "
-            "circle's exact center and its edge."
+            "a measurement axis until you assign one -- see 'Color' below, same "
+            "as any other line). Shift-drag a diameter endpoint to reshape the "
+            "ellipse; Ctrl+Shift-drag one instead to ROTATE it -- slide it "
+            "around the circle's already-fixed boundary without changing the "
+            "circle's shape (Make Parallel does this too, for a diameter "
+            "line). Shift-drag the circle's own curve (not either diameter "
+            "line) to move the whole thing. The 2 diameter lines always share "
+            "the same known length -- type it into either one's known-length "
+            "field and the other updates to match automatically, since "
+            "they're 2 measurements of the same circle. Snap Mode also pulls "
+            "onto a circle's exact center and its edge.\n"
+            "15b. Every line -- not just a circle's -- can be reassigned to a "
+            "different color/axis (or back to orange, meaning 'no axis') any "
+            "time via the 'Color' row in the known-length panel, right under "
+            "the length field. Recoloring never changes the line's own known "
+            "length, only which axis it calibrates.\n"
+            "16. The left-side options panel can be resized -- drag the "
+            "divider between it and the photo -- and scrolls with the mouse "
+            "wheel if the window is too short to show everything at once. "
+            "Esc, when nothing else is mid-action (drawing a line, dragging "
+            "a point, etc.), just clears whatever's currently selected."
         ))
 
     # -------------------------------------------------------------- tabs
@@ -3695,6 +3678,7 @@ class App:
                 tab.image_path = img_path
                 tab.project_path = project_path
                 tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
+                tab.ellipses = [Ellipse.from_dict(d) for d in entry.get("ellipses", [])]
                 tab.selected_line_ids = []
                 saved_modes = entry.get("axis_display_mode") or {}
                 tab.axis_display_mode = {
