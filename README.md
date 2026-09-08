@@ -5,10 +5,17 @@ color-coding, cross-line comparisons, and parallel-line drawing. Each open
 photo lives in its own tab, and the whole window -- every tab, even ones you
 never explicitly saved -- is remembered automatically between runs.
 
-## Setup
+## Download (Windows)
+
+Grab `ImageMeasureTool.exe` from the
+[Releases page](https://github.com/DrRobotNick5/ImageMesureTool/releases/latest)
+and run it directly -- no install, no Python required.
+
+## Running from source
 
 ```
 pip install pillow tkinterdnd2
+python image_measure_tool.py
 ```
 
 `tkinterdnd2` is optional and only enables dragging an image file onto a tab
@@ -17,11 +24,18 @@ Image instead. (Tkinter ships with the standard Python installer on
 Windows/macOS. On Linux, install your distro's `python3-tk` package if
 `import tkinter` fails.)
 
-## Run
+## Building the .exe yourself
 
 ```
-python image_measure_tool.py
+pip install pyinstaller pillow tkinterdnd2
+python -m PyInstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --collect-data tkinterdnd2 --name ImageMeasureTool image_measure_tool.py
 ```
+
+The result lands in `dist\ImageMeasureTool.exe`. `--add-data` is required, not
+optional -- `--icon` alone only sets the icon Explorer shows on the built
+`.exe` file itself, it doesn't bundle the icon file *into* the exe for the
+app to load at startup (which is what puts it in the window's title bar and
+taskbar entry while running).
 
 ## Tabs
 
