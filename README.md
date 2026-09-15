@@ -49,6 +49,11 @@ taskbar entry while running).
   every open tab by name (with a ✓ on whichever one's active) so you can
   jump straight to one even if it's been clipped off-screen by a narrow
   window or a lot of open tabs.
+- Press the **Left/Right arrow keys** to switch to the previous/next tab
+  (wrapping around at either end), without reaching for the mouse or the
+  Tabs ▾ menu. This is suppressed while a text field, dropdown, or the line
+  list has focus, so the arrow keys keep their normal job there (moving the
+  cursor, changing a dropdown selection, moving through the list).
 - The color/mode toolbar at the top and the Edit menu always act on
   whichever tab is currently in front.
 - The toolbar itself scrolls horizontally rather than clipping buttons at a
@@ -82,9 +87,14 @@ There are two separate kinds of file, for two separate purposes:
 - **The session** is a small file the app writes to on its own, every time
   it closes (and every minute while it's open, in case of a crash): which
   tabs were open and every line in them (whether or not you ever hit Save
-  Project), plus program-wide settings like Default Unit. The next time you
-  launch the app, it's read back automatically and the window comes back
-  exactly as you left it. It lives in your
+  Project), plus program-wide settings like Default Unit, Snap Mode, and
+  the main window's own size and screen position. The next time you launch
+  the app, it's read back automatically and the window comes back exactly
+  as you left it -- same size, same spot on screen, Snap Mode on or off the
+  same way you left it. (If the saved position would land off-screen --
+  say, a monitor from last time isn't connected anymore -- only the size is
+  restored, not the position, so the window can never open somewhere
+  unreachable.) It lives in your
   per-user app-data folder (`%APPDATA%\ImageMeasureTool\session.json` on
   Windows; `~/Library/Application Support/ImageMeasureTool/session.json` on
   macOS; `~/.config/ImageMeasureTool/session.json` on Linux) rather than
@@ -102,9 +112,13 @@ If you want a project to survive on its own regardless, use Save Project.
 ## How it works
 
 - **File > Open Image** loads a photo, or just drag an image file onto a
-  tab. A photo from a phone or camera
-  that comes in sideways is automatically rotated to match how Windows/Photos
-  displays it (both read the same EXIF orientation tag in the file).
+  tab. It's automatically zoomed to fit the window right away (scaled down
+  to fit if it's larger than the window, left at its real size -- never
+  zoomed in past 100% -- if it's smaller), so you don't have to zoom out
+  manually before you can see the whole thing. A photo from a phone or
+  camera that comes in sideways is automatically rotated to match how
+  Windows/Photos displays it (both read the same EXIF orientation tag in
+  the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
   press **Tab** (**Shift+Tab** to go back) to cycle to the next color, so you
   don't have to reach for the mouse between measurements. Tab does this even
@@ -293,7 +307,9 @@ If you want a project to survive on its own regardless, use Save Project.
   is close enough, within the same hit-test distance used for clicking a
   line. A point never snaps onto the very line/vertex it's already part of.
   Off by default; toggling it back off goes back to placing points exactly
-  where you click.
+  where you click. Whichever state you leave it in (on or off) is
+  remembered the same way everything else in "Where things are saved" is,
+  so it comes back exactly as you left it next launch.
 - **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
   drawing a line, deleting line(s), dragging an endpoint (one step per drag,
   not per pixel it moved), Make Parallel, a known-length or Display-section
@@ -321,7 +337,9 @@ If you want a project to survive on its own regardless, use Save Project.
   calibration for the whole image.
 - Scroll the mouse wheel to zoom in/out towards wherever your cursor is
   pointing (or use the Zoom In/Out/Fit toolbar buttons, which zoom towards
-  the center). Hold the **middle mouse button** and drag to pan. Only the
+  the center) -- or just press **Space** to snap straight back to fitting
+  the whole photo in the window, same as clicking Fit, without reaching for
+  the mouse. Hold the **middle mouse button** and drag to pan. Only the
   portion of the photo actually visible on screen gets resized each frame --
   and zooming out uses a pre-shrunk version of the photo instead of
   downsizing the full-resolution original every frame -- so both zooming in

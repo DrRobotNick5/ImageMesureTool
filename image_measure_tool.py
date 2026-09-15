@@ -1675,6 +1675,17 @@ class ProjectTab(ttk.Frame):
         self.app.set_status("Redid last undone action.")
 
     def on_canvas_press(self, event):
+        # Claim keyboard focus for the canvas on every click, the same way
+        # a real click on any other clickable widget already does (ttk
+        # buttons/comboboxes grab focus on click by default -- a plain
+        # tk.Canvas does not, unless told to). Without this, clicking away
+        # from the known-length field onto the canvas left the field still
+        # holding focus, so Left/Right kept being swallowed by it as "move
+        # the cursor" instead of resuming tab-switching -- you'd have to
+        # click directly on a tab to get the arrow keys back. This also
+        # fires the field's own <FocusOut> (commits it), same as clicking
+        # away from any other text field normally would.
+        self.canvas.focus_set()
         if not self.pil_image:
             return
 
@@ -3077,6 +3088,9 @@ class App:
         self.root.bind("<P>", self._make_parallel_shortcut)
         self.root.bind("<s>", self._snap_mode_shortcut)
         self.root.bind("<S>", self._snap_mode_shortcut)
+        self.root.bind("<space>", self._fit_to_window_shortcut)
+        self.root.bind("<Left>", lambda e: self._switch_tab_shortcut(-1))
+        self.root.bind("<Right>", lambda e: self._switch_tab_shortcut(1))
         self.root.bind("<Tab>", self._on_tab_key)
         self.root.bind("<Shift-Tab>", lambda e: self._on_tab_key(e, direction=-1))
         # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
@@ -3522,6 +3536,45 @@ class App:
                          f"{'snaps to nearby lines/vertices' if self.snap_mode.get() else 'no longer snaps'}.")
         return "break"
 
+    def _fit_to_window_shortcut(self, event=None):
+        """Space zooms/pans the active tab's photo to fit the window --
+        same as clicking the toolbar's Fit button -- guarded the same way
+        as 'P'/'S' so a space typed into a text field (or a button that
+        happens to have focus, where Space normally activates it) isn't
+        hijacked."""
+        tab = self.active_tab()
+        if tab is None:
+            return None
+        guarded = (tab.known_length_entry, tab.known_unit_box, tab.display_mode_box,
+                   tab.display_unit_box, tab.display_denominator_box)
+        focused = self.root.focus_get()
+        if focused in guarded or isinstance(focused, (tk.Button, ttk.Button, ttk.Checkbutton)):
+            return None
+        tab.fit_to_window()
+        tab.redraw()
+        self.set_status("Fit to window.")
+        return "break"
+
+    def _switch_tab_shortcut(self, direction):
+        """Left/Right arrow keys switch to the previous/next tab (wrapping
+        around at either end) -- guarded against any focused text/combo
+        field, where Left/Right obviously mean "move the cursor" or
+        "change the dropdown selection", not "switch tabs". The Measured
+        Lines list (a flat Treeview, no nested rows) is deliberately NOT
+        guarded here -- clicking a line in that list only ever uses
+        Up/Down to move between rows, never Left/Right, so after clicking
+        a row there Left/Right should still switch tabs immediately rather
+        than needing an extra click elsewhere first."""
+        focused = self.root.focus_get()
+        if isinstance(focused, (ttk.Entry, tk.Entry, ttk.Combobox, tk.Spinbox)):
+            return None
+        tabs = self.notebook.tabs()
+        if len(tabs) < 2:
+            return None
+        idx = self.notebook.index(self.notebook.select())
+        self.notebook.select(tabs[(idx + direction) % len(tabs)])
+        return "break"
+
     def _dispatch(self, method_name, *args):
         tab = self.active_tab()
         if tab is None:
@@ -3636,16 +3689,77 @@ class App:
             tabs = self._all_tabs()
             tabs_data = [t.snapshot() for t in tabs]
             active = self.notebook.index(self.notebook.select()) if tabs else 0
+            try:
+                window_state = self.root.state()
+            except tk.TclError:
+                window_state = "normal"
             data = {"version": 1, "active_index": active, "tabs": tabs_data,
                     "default_unit": self.default_unit.get(),
                     "fraction_denominator": self.fraction_denominator.get(),
-                    "default_display_mode": self.default_display_mode.get()}
+                    "default_display_mode": self.default_display_mode.get(),
+                    "window_geometry": self.root.geometry(),
+                    "window_state": window_state,
+                    "snap_mode": self.snap_mode.get()}
             os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
             tmp = SESSION_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, SESSION_PATH)
         except Exception:
+            pass
+
+    def _virtual_screen_bounds(self):
+        """The bounding box of ALL connected monitors combined, as
+        (left, top, right, bottom). winfo_screenwidth/height only ever
+        report the PRIMARY monitor's size -- on a multi-monitor setup, a
+        saved window position on a secondary monitor (very often placed to
+        the right of or above/below the primary one, i.e. with a negative
+        or >primary-width coordinate) would look "off-screen" to that
+        check even though it's perfectly reachable, which was silently
+        discarding the saved position on every close/reopen for anyone
+        using more than one monitor. On Windows, ask the OS directly for
+        the true virtual-desktop bounds; everywhere else, fall back to the
+        single-monitor size (no worse than before)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+                gsm = ctypes.windll.user32.GetSystemMetrics
+                left, top = gsm(SM_XVIRTUALSCREEN), gsm(SM_YVIRTUALSCREEN)
+                width, height = gsm(SM_CXVIRTUALSCREEN), gsm(SM_CYVIRTUALSCREEN)
+                if width > 0 and height > 0:
+                    return left, top, left + width, top + height
+            except Exception:
+                pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _apply_saved_geometry(self, geom):
+        """Restore the window to its saved size+position (see save_session)
+        -- but only the position if it would still land at least partly on
+        a currently-connected screen (across ALL monitors, see
+        _virtual_screen_bounds). Without this check, a saved position from
+        a monitor that's since been unplugged (or a resolution that's
+        changed) would leave the window opening off-screen where it can't
+        be reached -- so in that case just the SIZE is restored, and the
+        window manager picks a normal default position instead."""
+        m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geom)
+        if not m:
+            return
+        w, h, x, y = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        left, top, right, bottom = self._virtual_screen_bounds()
+        # A generous margin beyond the exact bounds, so a window that's
+        # mostly (but not perfectly) on-screen -- e.g. a few pixels of
+        # title bar poking past a monitor's edge -- still counts.
+        margin = 100
+        on_screen = (left - margin <= x <= right - margin and
+                     top - margin <= y <= bottom - margin)
+        try:
+            if on_screen:
+                self.root.geometry(geom)
+            else:
+                self.root.geometry(f"{w}x{h}")
+        except tk.TclError:
             pass
 
     def _restore_session(self):
@@ -3663,6 +3777,19 @@ class App:
             self.fraction_denominator.set(data["fraction_denominator"])
         if data.get("default_display_mode") in DISPLAY_MODE_CHOICES:
             self.default_display_mode.set(data["default_display_mode"])
+        if isinstance(data.get("snap_mode"), bool):
+            self.snap_mode.set(data["snap_mode"])
+        if data.get("window_geometry"):
+            self._apply_saved_geometry(data["window_geometry"])
+        if data.get("window_state") == "zoomed":
+            # Applied AFTER the geometry above, so the window is already
+            # positioned on the right monitor before maximizing onto it --
+            # maximize alone (without first placing it there) would just
+            # zoom onto whichever monitor Windows opened it on by default.
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
 
         restored_any = False
         notes = []
@@ -3746,7 +3873,36 @@ class App:
         self.root.destroy()
 
 
+def _make_dpi_aware():
+    """Windows only: tell the OS this process handles its own DPI scaling,
+    BEFORE any window is created. Without this, Windows silently scales
+    every coordinate Tk sees (winfo_screenwidth/height, root.geometry(),
+    GetSystemMetrics(SM_C*VIRTUALSCREEN)...) through a per-monitor "virtual"
+    factor -- which lines up fine on a single monitor, but on a multi-
+    monitor setup where the monitors use DIFFERENT scaling percentages
+    (e.g. a 150% laptop panel next to a 100% external display, a very
+    common combination), Tk's idea of where the window is and Windows'
+    idea of where the monitors are stop agreeing, so the saved-position
+    on-screen check (see App._virtual_screen_bounds) can reject a
+    perfectly valid position, or place the restored window on the wrong
+    monitor, or at the wrong size. Declaring per-monitor DPI awareness
+    makes all of those coordinates consistent, physical pixels throughout.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()  # older Windows fallback
+        except Exception:
+            pass
+
+
 def main():
+    _make_dpi_aware()
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
     try:
         ttk.Style().theme_use("clam")
