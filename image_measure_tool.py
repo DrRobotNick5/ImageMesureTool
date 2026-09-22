@@ -3644,14 +3644,36 @@ class App:
         fresh tab again if loading was cancelled/failed."""
         candidate = prefer_tab or self.active_tab()
         reuse = candidate is not None and candidate.is_blank()
+        previous = None if reuse else self._safe_selected_tab_name()
         target = candidate if reuse else self.new_tab(focus=False)
+        if not reuse:
+            # Select (map) the fresh tab BEFORE loading into it. The
+            # loader's fit-to-window call needs the canvas's real on-
+            # screen size, which Tk only reports for the currently-
+            # selected notebook page -- a still-unselected tab reports a
+            # tiny placeholder size instead, so an image dropped or opened
+            # into a fresh tab was silently fitting itself to that instead
+            # of the real window, i.e. loading small.
+            self.notebook.select(target)
+            self.root.update_idletasks()
         ok = loader(target)
         if ok:
             self.notebook.select(target)
         elif not reuse:
             self.notebook.forget(target)
             target.destroy()
+            if previous is not None:
+                try:
+                    self.notebook.select(previous)
+                except tk.TclError:
+                    pass
         return ok
+
+    def _safe_selected_tab_name(self):
+        try:
+            return self.notebook.select() or None
+        except tk.TclError:
+            return None
 
     def open_image(self):
         path = filedialog.askopenfilename(
