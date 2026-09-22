@@ -67,9 +67,31 @@ taskbar entry while running).
   grab the scrollbar itself), so every button stays reachable no matter
   how small the window gets. It disappears again once the window's wide
   enough that nothing overflows.
-- Drag either an image **or a `.imt` project file** onto a tab to open it --
-  same rule either way: onto a tab that already has something open, it
-  loads into a **new** tab; onto an empty tab, it loads right there.
+- Drag an image, a `.imt` project file, **or a `.imtw` workspace file**
+  onto a tab to open it. An image or a project loads into a **new** tab if
+  the one you dropped it on already has something open (or right into that
+  tab if it was empty). A workspace is different -- since it holds a whole
+  set of tabs at once, dropping one always replaces **every** currently
+  open tab with the ones from the file (asking first if that would lose
+  unsaved work), the same as `File > Open Workspace`.
+
+## Opening `.imt`/`.imtw` files from Explorer
+
+Double-clicking a `.imt` project or `.imtw` workspace file (or picking
+"Open with > Image Measure Tool") opens it straight into the app instead of
+just showing you its raw contents:
+
+- The **built .exe** registers itself as the default handler for both
+  extensions the first time it runs, under your own Windows user account
+  (no admin rights needed) -- no separate setup step. Running from source
+  (`python image_measure_tool.py`) never touches this registration; that
+  only happens for the actual built .exe.
+- If the app is **already open**, double-clicking a file hands it to that
+  same window instead of launching a second copy -- a project switches to
+  its tab (or opens a new one) and a workspace replaces all your tabs
+  (asking first if you have unsaved work), exactly like dropping the file
+  onto it would. If it's **not** already open, that launch becomes the one
+  running instance and opens the file itself.
 
 ## Where things are saved
 

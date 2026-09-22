@@ -56,7 +56,9 @@ import operator
 import os
 import re
 import sys
+import threading
 import tkinter as tk
+from multiprocessing.connection import Client, Listener
 
 
 def resource_path(relative_path):
@@ -165,6 +167,20 @@ def _session_dir():
 
 SESSION_PATH = os.path.join(_session_dir(), "session.json")
 SESSION_AUTOSAVE_MS = 60_000  # also save periodically, in case of a crash
+
+# --------------------------------------------------------- single instance
+# Double-clicking a .imt/.imtw file (or "Open with") launches a NEW copy of
+# the exe with that path on its command line -- SINGLE_INSTANCE_* is how a
+# freshly-launched copy hands that path over to an ALREADY-running window
+# instead of opening a second one. See main()/_forward_to_running_instance
+# and App._start_single_instance_listener/_handle_external_open.
+SINGLE_INSTANCE_AUTHKEY = b"image-measure-tool-single-instance-v1"
+if sys.platform == "win32":
+    # A named pipe -- doesn't touch the filesystem, so there's no stale
+    # file to clean up after a crash.
+    SINGLE_INSTANCE_ADDRESS = r"\\.\pipe\ImageMeasureTool-SingleInstance"
+else:
+    SINGLE_INSTANCE_ADDRESS = os.path.join(_session_dir(), "single_instance.sock")
 
 
 def _embedded_bytes_from_project_file(path):
@@ -1026,6 +1042,9 @@ class ProjectTab(ttk.Frame):
         paths = self.canvas.tk.splitlist(event.data)
         for path in paths:
             lower = path.lower()
+            if lower.endswith(WORKSPACE_EXT):
+                self.app.handle_dropped_workspace(path)
+                return
             if lower.endswith(PROJECT_EXT) or lower.endswith(LEGACY_PROJECT_EXT):
                 self.app.handle_dropped_project(self, path)
                 return
@@ -1033,8 +1052,8 @@ class ProjectTab(ttk.Frame):
                 self.app.handle_dropped_file(self, path)
                 return
         messagebox.showinfo("Not recognized",
-                             "Drop an image file (jpg/png/bmp/tif/webp) or a project "
-                             f"file ({PROJECT_EXT}).")
+                             "Drop an image file (jpg/png/bmp/tif/webp), a project "
+                             f"file ({PROJECT_EXT}), or a workspace file ({WORKSPACE_EXT}).")
 
     def _apply_loaded_bytes(self, raw_bytes, rotation_turns=0):
         """Build self.pil_image (+ pyramid) from raw image FILE bytes --
@@ -3120,6 +3139,7 @@ class App:
         if not self._restore_session():
             self.new_tab()
         self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
+        self._start_single_instance_listener()
 
     # ---------------------------------------------------------- UI setup
     def _build_menu(self):
@@ -3748,6 +3768,11 @@ class App:
     def handle_dropped_project(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_project_data(path), prefer_tab=source_tab)
 
+    def handle_dropped_workspace(self, path):
+        # A workspace replaces ALL open tabs (see _open_workspace_path), so
+        # which tab it was dropped onto doesn't matter here.
+        self._open_workspace_path(path)
+
     # ------------------------------------------------------------ workspace
     # A workspace (.imtw, File > Save All Tabs) is one file holding EVERY
     # open tab at once -- each tab's data is written the same way a single
@@ -3823,6 +3848,9 @@ class App:
                        ("All files", "*.*")])
         if not path:
             return
+        self._open_workspace_path(path)
+
+    def _open_workspace_path(self, path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -4080,8 +4108,101 @@ class App:
         self.save_session()
         self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
 
+    # ------------------------------------------------------ single instance
+    def _start_single_instance_listener(self):
+        """Best-effort: starts a background thread listening on
+        SINGLE_INSTANCE_ADDRESS for a path handed over by a LATER launch of
+        the app (see _forward_to_running_instance/main), so double-clicking
+        another .imt/.imtw file while this window is already open lands in
+        THIS window instead of opening a duplicate. Never raises -- a
+        machine where the IPC channel can't be created (permissions, a
+        stale socket, whatever) should still run the app normally, just
+        without that convenience."""
+        self._single_instance_listener = None
+        self._single_instance_stop = False
+        try:
+            if sys.platform != "win32" and os.path.exists(SINGLE_INSTANCE_ADDRESS):
+                # A Unix socket path left behind by a crash -- Windows named
+                # pipes have no such file to clean up.
+                os.remove(SINGLE_INSTANCE_ADDRESS)
+            listener = Listener(SINGLE_INSTANCE_ADDRESS, authkey=SINGLE_INSTANCE_AUTHKEY)
+        except Exception:
+            return
+        self._single_instance_listener = listener
+        thread = threading.Thread(target=self._single_instance_loop, args=(listener,), daemon=True)
+        thread.start()
+
+    def _single_instance_loop(self, listener):
+        # Runs on a background thread for the app's whole lifetime --
+        # accept() blocks until another launch connects (or the listener
+        # is closed by on_app_close, which raises here and ends the loop).
+        while not self._single_instance_stop:
+            try:
+                conn = listener.accept()
+            except Exception:
+                return
+            try:
+                msg = conn.recv()
+            except Exception:
+                msg = None
+            finally:
+                conn.close()
+            if isinstance(msg, dict) and msg.get("cmd") == "open":
+                paths = msg.get("paths") or []
+                # Tkinter isn't thread-safe -- marshal the actual open back
+                # onto the main thread instead of touching the UI here.
+                self.root.after(0, self._handle_external_open, paths)
+
+    def _handle_external_open(self, paths):
+        try:
+            self.root.deiconify()
+        except tk.TclError:
+            pass
+        self.root.lift()
+        self.root.focus_force()
+        for path in paths:
+            self.open_path(path)
+
+    def open_path(self, path):
+        """Open a single path -- an image, a .imt project, or a .imtw
+        workspace -- whichever it is, by extension. Reuses an already-open
+        tab/workspace for that exact path instead of duplicating it. This
+        is what a normal double-click-to-open funnels through AND what an
+        incoming single-instance request (see _handle_external_open)
+        funnels through, so both behave identically."""
+        lower = path.lower()
+        if lower.endswith(WORKSPACE_EXT):
+            self._open_workspace_path(path)
+            return
+        if lower.endswith(PROJECT_EXT) or lower.endswith(LEGACY_PROJECT_EXT):
+            for tab in self._all_tabs():
+                if tab.project_path == path:
+                    self.notebook.select(tab)
+                    return
+            self._open_into_tab(lambda tab: tab.load_project_data(path))
+            return
+        if lower.endswith(IMAGE_EXTS):
+            for tab in self._all_tabs():
+                if tab.image_path == path and tab.project_path is None:
+                    self.notebook.select(tab)
+                    return
+            self._open_into_tab(lambda tab: tab.load_image_path(path))
+            return
+        messagebox.showinfo(
+            "Not recognized",
+            "Don't know how to open this file -- expected an image "
+            "(jpg/png/bmp/tif/webp), a project "
+            f"({PROJECT_EXT}), or a workspace ({WORKSPACE_EXT}).")
+
     def on_app_close(self):
         self.save_session()
+        self._single_instance_stop = True
+        listener = getattr(self, "_single_instance_listener", None)
+        if listener is not None:
+            try:
+                listener.close()
+            except Exception:
+                pass
         self.root.destroy()
 
 
@@ -4113,14 +4234,78 @@ def _make_dpi_aware():
             pass
 
 
+def register_file_association():
+    """Windows only, and only for the BUILT exe (PyInstaller sets
+    sys.frozen) -- silently (re-)registers this app as the default handler
+    for both .imt and .imtw, every time the built exe starts. Written to
+    HKEY_CURRENT_USER (the per-user registry hive), which needs no admin
+    rights and still shows up in Explorer's "Open with" for the current
+    user. Running from source (`python image_measure_tool.py`) never
+    touches the registry -- there's no stable, permanent exe path to point
+    it at in that case, and silently claiming a file association while
+    just developing would be a bad surprise."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import winreg
+        exe = sys.executable
+        command = f'"{exe}" "%1"'
+        for ext, prog_id, description in (
+            (PROJECT_EXT, "ImageMeasureTool.Project", "Image Measure Tool Project"),
+            (WORKSPACE_EXT, "ImageMeasureTool.Workspace", "Image Measure Tool Workspace"),
+        ):
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{prog_id}") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, description)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{prog_id}\\shell\\open\\command") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, command)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{ext}") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, prog_id)
+    except Exception:
+        pass  # best-effort -- a broken registry write should never stop the app from starting
+
+
+def _forward_to_running_instance(paths):
+    """Try to hand `paths` off to an already-running instance over the
+    single-instance IPC channel. Returns True if that succeeded (the
+    caller should exit immediately without opening a second window), False
+    if nothing's listening (the caller should become the primary instance
+    itself, and open `paths` in its own new window)."""
+    if not paths:
+        return False
+    try:
+        conn = Client(SINGLE_INSTANCE_ADDRESS, authkey=SINGLE_INSTANCE_AUTHKEY)
+        try:
+            conn.send({"cmd": "open", "paths": paths})
+        finally:
+            conn.close()
+        return True
+    except Exception:
+        return False
+
+
 def main():
     _make_dpi_aware()
+    # argv[1:] is whatever file Explorer double-clicked/"Open with"-ed this
+    # launch with (via the association register_file_association sets up),
+    # if any -- ignore stray flag-looking args rather than choking on them.
+    incoming_paths = [p for p in sys.argv[1:] if p and not p.startswith("-")]
+    if incoming_paths and _forward_to_running_instance(incoming_paths):
+        # Handed off to the window that's already open -- this launch's
+        # only job was to deliver the file, so it's done.
+        return
+
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
     try:
         ttk.Style().theme_use("clam")
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+    register_file_association()
+    for path in incoming_paths:
+        app.open_path(path)
     root.mainloop()
 
 
