@@ -132,6 +132,11 @@ MAX_UNDO_STEPS = 50
 # .imt.json was this app's project extension before projects started embedding
 # a copy of the image -- still openable, just no longer the default Save name.
 LEGACY_PROJECT_EXT = ".imt.json"
+# A "workspace" (File > Save All Tabs) is a single portable file holding
+# EVERY open tab at once -- same idea as a .imt project, just for the whole
+# window instead of one tab -- so opening it again reopens every tab in
+# exactly the state it was saved in.
+WORKSPACE_EXT = ".imtw"
 
 # --------------------------------------------------------------- session ---
 # Per-project files (.imt, saved with File > Save Project) are the portable,
@@ -3071,6 +3076,11 @@ class App:
         # line's body, within the usual hit-test tolerance. See
         # ProjectTab._apply_snap.
         self.snap_mode = tk.BooleanVar(value=False)
+        # The last workspace file (.imtw, File > Save/Open All Tabs) saved
+        # to or opened from -- lets "Save All Tabs" re-save in place
+        # without asking for a filename every time, same as a per-tab
+        # project's Save vs Save As.
+        self.workspace_path = None
 
         self._build_menu()
         self._build_toolbar()
@@ -3124,7 +3134,12 @@ class App:
         filemenu.add_command(label="Save Project As...",
                               command=lambda: self._dispatch("save_project_as"))
         filemenu.add_separator()
+        filemenu.add_command(label="Open Workspace (All Tabs)...", command=self.open_workspace)
+        filemenu.add_command(label="Save All Tabs", command=self.save_workspace)
+        filemenu.add_command(label="Save All Tabs As...", command=self.save_workspace_as)
+        filemenu.add_separator()
         filemenu.add_command(label="Close Tab", command=self.close_active_tab, accelerator="Ctrl+W")
+        filemenu.add_command(label="Close All Tabs", command=self.close_all_tabs)
         filemenu.add_separator()
         filemenu.add_command(label="Export Measurements (CSV)...",
                               command=lambda: self._dispatch("export_csv"))
@@ -3264,6 +3279,7 @@ class App:
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
         ttk.Button(bar, text="Close Tab \u2715", command=self.close_active_tab).pack(side="left", padx=2)
+        ttk.Button(bar, text="Close All Tabs", command=self.close_all_tabs).pack(side="left", padx=2)
         # ttk.Notebook doesn't scroll or wrap when there are more tabs than
         # fit the window -- it just clips the overflow ones with no way to
         # click them -- so this dropdown is the fallback that always reaches
@@ -3432,6 +3448,39 @@ class App:
         tab.destroy()
         if not self.notebook.tabs():
             self.new_tab()
+
+    def close_all_tabs(self):
+        """Close every open tab at once -- asks ONCE up front if any of
+        them have unsaved changes (rather than the usual one-dialog-per-
+        tab from Close Tab), since confirming N times in a row for one
+        button press would be tedious. Always leaves one fresh blank tab
+        behind, same as closing the very last tab normally does."""
+        if not self._confirm_discard_all_tabs(
+                "Close all tabs?"):
+            return
+        self._close_all_tabs_unconditionally()
+
+    def _confirm_discard_all_tabs(self, heading):
+        """Shared by Close All Tabs and Open Workspace (which also has to
+        get rid of every currently-open tab before loading the new set) --
+        skips the dialog entirely when nothing would actually be lost."""
+        dirty_tabs = [t for t in self._all_tabs() if t.dirty]
+        if not dirty_tabs:
+            return True
+        names = ", ".join(f'"{t.display_name()}"' for t in dirty_tabs)
+        plural = "s have" if len(dirty_tabs) != 1 else " has"
+        return messagebox.askyesno(
+            "Unsaved changes",
+            f"{heading}\n\n"
+            f"{len(dirty_tabs)} tab{plural} measurements that were never saved "
+            f"as a project file or a workspace: {names}.\n\n"
+            "Continue and lose those changes?")
+
+    def _close_all_tabs_unconditionally(self):
+        for tab in self._all_tabs():
+            self.notebook.forget(tab)
+            tab.destroy()
+        self.new_tab()
 
     def _on_notebook_tab_closed(self, event=None):
         idx = self.notebook.last_closed_index
@@ -3699,6 +3748,119 @@ class App:
     def handle_dropped_project(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_project_data(path), prefer_tab=source_tab)
 
+    # ------------------------------------------------------------ workspace
+    # A workspace (.imtw, File > Save All Tabs) is one file holding EVERY
+    # open tab at once -- each tab's data is written the same way a single
+    # .imt project is (including its own embedded copy of the image, so the
+    # whole workspace stays portable even off this machine) -- so opening
+    # it again reopens every tab in exactly the state it was saved in.
+    def save_workspace(self):
+        if self.workspace_path:
+            self._write_workspace(self.workspace_path)
+        else:
+            self.save_workspace_as()
+
+    def save_workspace_as(self):
+        savable = [t for t in self._all_tabs() if not t.is_blank()]
+        if not savable:
+            messagebox.showinfo("Nothing to save", "Open at least one image first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save all tabs as a workspace",
+            defaultextension=WORKSPACE_EXT,
+            filetypes=[("Image Measure workspace", f"*{WORKSPACE_EXT}")])
+        if not path:
+            return
+        self.workspace_path = path
+        self._write_workspace(path)
+
+    def _write_workspace(self, path):
+        savable = [t for t in self._all_tabs() if not t.is_blank()]
+        if not savable:
+            messagebox.showinfo("Nothing to save", "Open at least one image first.")
+            return
+        active_tab = self.active_tab()
+        active_index = savable.index(active_tab) if active_tab in savable else 0
+
+        tabs_data = []
+        for t in savable:
+            image_data_b64 = None
+            if t.image_bytes_cache:
+                image_data_b64 = base64.b64encode(t.image_bytes_cache).decode("ascii")
+            tabs_data.append({
+                "image_path": t.image_path,
+                "image_data": image_data_b64,
+                "rotation_turns": t.rotation_turns,
+                "scale": t.scale,
+                "view_x": t.view_x,
+                "view_y": t.view_y,
+                "lines": [ln.to_dict() for ln in t.lines],
+                "ellipses": [el.to_dict() for el in t.ellipses],
+                "axis_display_mode": t.axis_display_mode,
+            })
+        data = {"version": 1, "active_index": active_index, "tabs": tabs_data}
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            messagebox.showerror("Could not save workspace", str(exc))
+            return
+
+        self.workspace_path = path
+        for t in savable:
+            t.dirty = False
+            self.update_tab_title(t)
+        size_kb = os.path.getsize(path) // 1024
+        self.set_status(f"Saved {len(tabs_data)} tab(s) to workspace "
+                         f"{os.path.basename(path)} ({size_kb:,} KB).")
+
+    def open_workspace(self):
+        path = filedialog.askopenfilename(
+            title="Open a workspace (all tabs)",
+            filetypes=[("Image Measure workspace", f"*{WORKSPACE_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Could not open workspace", str(exc))
+            return
+        entries = data.get("tabs", [])
+        if not entries:
+            messagebox.showinfo("Empty workspace",
+                                 "That workspace file doesn't have any tabs saved in it.")
+            return
+
+        # Opening a workspace replaces every currently-open tab -- same
+        # "you're about to lose this" check Close All Tabs uses.
+        if not self._confirm_discard_all_tabs(
+                "Opening this workspace will close all your current tabs first."):
+            return
+        for tab in self._all_tabs():
+            self.notebook.forget(tab)
+            tab.destroy()
+
+        notes = []
+        for entry in entries:
+            tab, title, note = self._build_tab_from_entry(entry)
+            if note:
+                notes.append(note)
+            self.notebook.add(tab, text=title)
+
+        self.workspace_path = path
+        idx = data.get("active_index", 0)
+        tabs = self.notebook.tabs()
+        if 0 <= idx < len(tabs):
+            self.notebook.select(tabs[idx])
+        msg = f"Opened {len(tabs)} tab(s) from workspace {os.path.basename(path)}."
+        if notes:
+            msg += " " + "; ".join(notes) + "."
+        self.set_status(msg)
+
     # -------------------------------------------------------------- session
     def _all_tabs(self):
         return [self.notebook.nametowidget(w) for w in self.notebook.tabs()]
@@ -3784,6 +3946,87 @@ class App:
         except tk.TclError:
             pass
 
+    def _build_tab_from_entry(self, entry):
+        """Build one fresh ProjectTab from a saved per-tab dict -- shared by
+        the session.json autosave restore AND Open Workspace (.imtw)
+        loading, so both behave identically. Always returns a (tab, title,
+        note) triple -- even on total failure it still returns a blank
+        placeholder tab (never silently drops one, so you don't lose track
+        of "I had N tabs, now there's N-1") -- the caller is responsible
+        for actually adding it to the notebook.
+
+        Tries, in order, to get the image's raw bytes from: the live file
+        at image_path (freshest, if it hasn't moved); "image_data" embedded
+        directly in the entry itself (present in .imtw workspace files,
+        which is what keeps THOSE fully portable even off this machine);
+        then the copy embedded in project_path's own .imt file (present
+        only for a tab that was ever explicitly Saved as a Project -- this
+        is the fallback session.json restore has always used, since
+        session.json itself never embeds image bytes, to keep the autosave
+        file small)."""
+        tab = ProjectTab(self.notebook, self)
+        title = "Untitled"
+        note = None
+        img_path = entry.get("image_path")
+        project_path = entry.get("project_path")
+        rotation_turns = entry.get("rotation_turns", 0)
+
+        raw = None
+        recovered_from = None
+        if img_path and os.path.exists(img_path):
+            try:
+                with open(img_path, "rb") as f:
+                    raw = f.read()
+            except Exception:
+                raw = None
+        if raw is None and entry.get("image_data"):
+            try:
+                raw = base64.b64decode(entry["image_data"])
+            except Exception:
+                raw = None
+            if raw is not None:
+                recovered_from = "recovered from its embedded copy"
+        if raw is None and project_path and os.path.exists(project_path):
+            raw = _embedded_bytes_from_project_file(project_path)
+            if raw is not None:
+                recovered_from = "recovered from its saved project file"
+
+        ok = False
+        if raw is not None:
+            try:
+                tab._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
+                ok = True
+            except Exception:
+                ok = False
+
+        if ok:
+            tab.image_path = img_path
+            tab.project_path = project_path
+            tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
+            tab.ellipses = [Ellipse.from_dict(d) for d in entry.get("ellipses", [])]
+            tab.selected_line_ids = []
+            saved_modes = entry.get("axis_display_mode") or {}
+            tab.axis_display_mode = {
+                color: saved_modes.get(color) for color in AXIS_COLORS}
+            if entry.get("scale"):
+                tab.scale = entry["scale"]
+                tab.view_x = entry.get("view_x", tab.view_x)
+                tab.view_y = entry.get("view_y", tab.view_y)
+                tab._render_image()
+            else:
+                tab.fit_to_window()
+            tab.dirty = False
+            tab._clear_placeholder()
+            tab.redraw()
+            title = tab.display_name()
+            self.update_tab_title(tab)
+            if recovered_from:
+                note = f"'{title}' had moved -- {recovered_from}"
+        elif img_path:
+            note = f"couldn't find '{os.path.basename(img_path)}' -- that tab is blank"
+
+        return tab, title, note
+
     def _restore_session(self):
         if not os.path.exists(SESSION_PATH):
             return False
@@ -3816,62 +4059,9 @@ class App:
         restored_any = False
         notes = []
         for entry in data.get("tabs", []):
-            tab = ProjectTab(self.notebook, self)
-            title = "Untitled"
-            img_path = entry.get("image_path")
-            project_path = entry.get("project_path")
-            rotation_turns = entry.get("rotation_turns", 0)
-
-            # Get the image's raw bytes from wherever they're still available:
-            # the live file first, and -- if that's gone (moved/deleted) but
-            # this tab was ever saved as a project -- the copy embedded in
-            # that .imt file, same as opening the project directly would.
-            raw = None
-            recovered_via_project = False
-            if img_path and os.path.exists(img_path):
-                try:
-                    with open(img_path, "rb") as f:
-                        raw = f.read()
-                except Exception:
-                    raw = None
-            if raw is None and project_path and os.path.exists(project_path):
-                raw = _embedded_bytes_from_project_file(project_path)
-                recovered_via_project = raw is not None
-
-            ok = False
-            if raw is not None:
-                try:
-                    tab._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
-                    ok = True
-                except Exception:
-                    ok = False
-
-            if ok:
-                tab.image_path = img_path
-                tab.project_path = project_path
-                tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
-                tab.ellipses = [Ellipse.from_dict(d) for d in entry.get("ellipses", [])]
-                tab.selected_line_ids = []
-                saved_modes = entry.get("axis_display_mode") or {}
-                tab.axis_display_mode = {
-                    color: saved_modes.get(color) for color in AXIS_COLORS}
-                if entry.get("scale"):
-                    tab.scale = entry["scale"]
-                    tab.view_x = entry.get("view_x", tab.view_x)
-                    tab.view_y = entry.get("view_y", tab.view_y)
-                    tab._render_image()
-                else:
-                    tab.fit_to_window()
-                tab.dirty = False
-                tab._clear_placeholder()
-                tab.redraw()
-                title = tab.display_name()
-                self.update_tab_title(tab)
-                if recovered_via_project:
-                    notes.append(f"'{title}' had moved -- recovered from its saved project file")
-            elif img_path:
-                notes.append(f"couldn't find '{os.path.basename(img_path)}' -- that tab is blank")
-
+            tab, title, note = self._build_tab_from_entry(entry)
+            if note:
+                notes.append(note)
             self.notebook.add(tab, text=title)
             restored_any = True
 

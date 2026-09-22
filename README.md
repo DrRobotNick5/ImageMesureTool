@@ -44,16 +44,21 @@ taskbar entry while running).
   **File > Open Image** (Ctrl+O) starts another; the small **✕** on a tab
   closes it (middle-click a tab, or Ctrl+W / File > Close Tab, do the same
   thing). If a tab has measurements that were never saved as a project
-  file, closing it asks you to confirm first.
+  file (or a workspace -- see below), closing it asks you to confirm first.
+- **Close All Tabs** (toolbar button, or File menu) closes every open tab
+  at once, leaving one fresh blank tab behind. If any of them have unsaved
+  measurements, it asks ONCE up front (naming which tabs), rather than one
+  confirmation per tab.
 - The **Tabs ▾** button in the toolbar, next to New Tab and Close Tab, lists
   every open tab by name (with a ✓ on whichever one's active) so you can
   jump straight to one even if it's been clipped off-screen by a narrow
   window or a lot of open tabs.
 - Press the **Left/Right arrow keys** to switch to the previous/next tab
   (wrapping around at either end), without reaching for the mouse or the
-  Tabs ▾ menu. This is suppressed while a text field, dropdown, or the line
-  list has focus, so the arrow keys keep their normal job there (moving the
-  cursor, changing a dropdown selection, moving through the list).
+  Tabs ▾ menu. This is suppressed while a text field or dropdown has focus,
+  so the arrow keys keep their normal job there (moving the cursor,
+  changing a dropdown selection) -- but works fine right after clicking a
+  line in the Measured Lines list, since that list only ever uses Up/Down.
 - The color/mode toolbar at the top and the Edit menu always act on
   whichever tab is currently in front.
 - The toolbar itself scrolls horizontally rather than clipping buttons at a
@@ -68,8 +73,19 @@ taskbar entry while running).
 
 ## Where things are saved
 
-There are two separate kinds of file, for two separate purposes:
+There are three separate kinds of file, for three separate purposes:
 
+- **Workspace files** (`File > Save All Tabs` / `Save All Tabs As...`,
+  `.imtw`) save **every open tab at once** into a single file -- each tab's
+  image (a full embedded copy, same as a `.imt` project), rotation, lines,
+  and its exact zoom/pan, plus which tab was the active one. `File > Open
+  Workspace (All Tabs)...` reopens all of them in exactly that state in one
+  step. Opening a workspace replaces whatever tabs you currently have open
+  -- if any of them have unsaved measurements, you're asked to confirm
+  first, the same way Close All Tabs asks. `Save All Tabs` re-saves to the
+  same workspace file once you've used `Save All Tabs As...` to name one;
+  each tab still keeps its own individual `.imt` project association (if
+  it has one) independently of the workspace.
 - **Project files** (`File > Save Project`, `.imt`) are the deliberate,
   portable save format -- one file per project, containing that tab's image
   path, **a full copy of the image itself**, its rotation, and every line
@@ -107,7 +123,8 @@ There are two separate kinds of file, for two separate purposes:
 
 Closing a tab with the ✕ removes it right away, even from the session --
 only tabs still open when the app quits get carried forward automatically.
-If you want a project to survive on its own regardless, use Save Project.
+If you want a project to survive on its own regardless, use Save Project
+(or Save All Tabs for the whole set at once).
 
 ## How it works
 
