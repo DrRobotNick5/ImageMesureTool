@@ -56,7 +56,10 @@ import operator
 import os
 import re
 import sys
+import threading
+import time
 import tkinter as tk
+from multiprocessing.connection import Client, Listener
 
 
 def resource_path(relative_path):
@@ -132,6 +135,11 @@ MAX_UNDO_STEPS = 50
 # .imt.json was this app's project extension before projects started embedding
 # a copy of the image -- still openable, just no longer the default Save name.
 LEGACY_PROJECT_EXT = ".imt.json"
+# A "workspace" (File > Save All Tabs) is a single portable file holding
+# EVERY open tab at once -- same idea as a .imt project, just for the whole
+# window instead of one tab -- so opening it again reopens every tab in
+# exactly the state it was saved in.
+WORKSPACE_EXT = ".imtw"
 
 # --------------------------------------------------------------- session ---
 # Per-project files (.imt, saved with File > Save Project) are the portable,
@@ -160,6 +168,26 @@ def _session_dir():
 
 SESSION_PATH = os.path.join(_session_dir(), "session.json")
 SESSION_AUTOSAVE_MS = 60_000  # also save periodically, in case of a crash
+# File > Open's "recently used" list (see App.open_recent_dialog) -- every
+# .imt project or .imtw workspace opened OR saved gets recorded here,
+# newest first, so it's persisted across launches the same way session.json
+# and recent_files.json's neighbors are.
+RECENT_FILES_PATH = os.path.join(_session_dir(), "recent_files.json")
+MAX_RECENT_FILES = 25
+
+# --------------------------------------------------------- single instance
+# Double-clicking a .imt/.imtw file (or "Open with") launches a NEW copy of
+# the exe with that path on its command line -- SINGLE_INSTANCE_* is how a
+# freshly-launched copy hands that path over to an ALREADY-running window
+# instead of opening a second one. See main()/_forward_to_running_instance
+# and App._start_single_instance_listener/_handle_external_open.
+SINGLE_INSTANCE_AUTHKEY = b"image-measure-tool-single-instance-v1"
+if sys.platform == "win32":
+    # A named pipe -- doesn't touch the filesystem, so there's no stale
+    # file to clean up after a crash.
+    SINGLE_INSTANCE_ADDRESS = r"\\.\pipe\ImageMeasureTool-SingleInstance"
+else:
+    SINGLE_INSTANCE_ADDRESS = os.path.join(_session_dir(), "single_instance.sock")
 
 
 def _embedded_bytes_from_project_file(path):
@@ -1021,6 +1049,9 @@ class ProjectTab(ttk.Frame):
         paths = self.canvas.tk.splitlist(event.data)
         for path in paths:
             lower = path.lower()
+            if lower.endswith(WORKSPACE_EXT):
+                self.app.handle_dropped_workspace(path)
+                return
             if lower.endswith(PROJECT_EXT) or lower.endswith(LEGACY_PROJECT_EXT):
                 self.app.handle_dropped_project(self, path)
                 return
@@ -1028,8 +1059,8 @@ class ProjectTab(ttk.Frame):
                 self.app.handle_dropped_file(self, path)
                 return
         messagebox.showinfo("Not recognized",
-                             "Drop an image file (jpg/png/bmp/tif/webp) or a project "
-                             f"file ({PROJECT_EXT}).")
+                             "Drop an image file (jpg/png/bmp/tif/webp), a project "
+                             f"file ({PROJECT_EXT}), or a workspace file ({WORKSPACE_EXT}).")
 
     def _apply_loaded_bytes(self, raw_bytes, rotation_turns=0):
         """Build self.pil_image (+ pyramid) from raw image FILE bytes --
@@ -1675,6 +1706,17 @@ class ProjectTab(ttk.Frame):
         self.app.set_status("Redid last undone action.")
 
     def on_canvas_press(self, event):
+        # Claim keyboard focus for the canvas on every click, the same way
+        # a real click on any other clickable widget already does (ttk
+        # buttons/comboboxes grab focus on click by default -- a plain
+        # tk.Canvas does not, unless told to). Without this, clicking away
+        # from the known-length field onto the canvas left the field still
+        # holding focus, so Left/Right kept being swallowed by it as "move
+        # the cursor" instead of resuming tab-switching -- you'd have to
+        # click directly on a tab to get the arrow keys back. This also
+        # fires the field's own <FocusOut> (commits it), same as clicking
+        # away from any other text field normally would.
+        self.canvas.focus_set()
         if not self.pil_image:
             return
 
@@ -2893,6 +2935,7 @@ class ProjectTab(ttk.Frame):
             json.dump(data, f, indent=2)
         self.dirty = False
         self.app.update_tab_title(self)
+        self.app._record_recent_file(path)
         size_note = ""
         if image_data_b64:
             size_kb = (len(image_data_b64) * 3 // 4) // 1024
@@ -2957,6 +3000,7 @@ class ProjectTab(ttk.Frame):
             color: saved_modes.get(color) for color in AXIS_COLORS}
         self.dirty = False
         self.app.update_tab_title(self)
+        self.app._record_recent_file(path)
         self.fit_to_window()
         self.redraw()
         self.app.set_status(f"Loaded project {path}{status_note}")
@@ -3060,6 +3104,16 @@ class App:
         # line's body, within the usual hit-test tolerance. See
         # ProjectTab._apply_snap.
         self.snap_mode = tk.BooleanVar(value=False)
+        # The last workspace file (.imtw, File > Save/Open All Tabs) saved
+        # to or opened from -- lets "Save All Tabs" re-save in place
+        # without asking for a filename every time, same as a per-tab
+        # project's Save vs Save As.
+        self.workspace_path = None
+        # The Open... dialog's own last size+position (separate from the
+        # main window's -- see save_session/_restore_session), so it opens
+        # back up where you left it instead of the same default spot every
+        # time.
+        self.open_dialog_geometry = None
 
         self._build_menu()
         self._build_toolbar()
@@ -3077,6 +3131,9 @@ class App:
         self.root.bind("<P>", self._make_parallel_shortcut)
         self.root.bind("<s>", self._snap_mode_shortcut)
         self.root.bind("<S>", self._snap_mode_shortcut)
+        self.root.bind("<space>", self._fit_to_window_shortcut)
+        self.root.bind("<Left>", lambda e: self._switch_tab_shortcut(-1))
+        self.root.bind("<Right>", lambda e: self._switch_tab_shortcut(1))
         self.root.bind("<Tab>", self._on_tab_key)
         self.root.bind("<Shift-Tab>", lambda e: self._on_tab_key(e, direction=-1))
         # Windows/some Linux send ISO_Left_Tab for Shift+Tab instead:
@@ -3090,12 +3147,19 @@ class App:
         self.root.bind("<Control-z>", lambda e: self._dispatch("undo"))
         self.root.bind("<Control-y>", lambda e: self._dispatch("redo"))
         self.root.bind("<Control-Shift-Z>", lambda e: self._dispatch("redo"))
+        # Ctrl+Shift+O = the unified Open... dialog, Ctrl+Shift+S = Save
+        # All Tabs (workspace) -- picked to sit next to the existing
+        # Ctrl+O (Open Image) / Ctrl+S (Save Project) so the "bigger"
+        # multi-tab operations share the same letter with Shift added.
+        self.root.bind("<Control-Shift-O>", lambda e: self.open_recent_dialog())
+        self.root.bind("<Control-Shift-S>", lambda e: self.save_workspace())
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
         if not self._restore_session():
             self.new_tab()
         self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
+        self._start_single_instance_listener()
 
     # ---------------------------------------------------------- UI setup
     def _build_menu(self):
@@ -3104,13 +3168,22 @@ class App:
         filemenu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+T")
         filemenu.add_command(label="Open Image...", command=self.open_image, accelerator="Ctrl+O")
         filemenu.add_separator()
-        filemenu.add_command(label="Open Project...", command=self.open_project)
+        # One unified "Open..." for both a .imt project and a .imtw
+        # workspace -- open_path() (which this dialog funnels through)
+        # already tells them apart by extension, so there's no reason to
+        # make you pick which kind of file you're opening up front.
+        filemenu.add_command(label="Open...", command=self.open_recent_dialog,
+                              accelerator="Ctrl+Shift+O")
         filemenu.add_command(label="Save Project", command=lambda: self._dispatch("save_project"),
                               accelerator="Ctrl+S")
         filemenu.add_command(label="Save Project As...",
                               command=lambda: self._dispatch("save_project_as"))
+        filemenu.add_command(label="Save All Tabs", command=self.save_workspace,
+                              accelerator="Ctrl+Shift+S")
+        filemenu.add_command(label="Save All Tabs As...", command=self.save_workspace_as)
         filemenu.add_separator()
         filemenu.add_command(label="Close Tab", command=self.close_active_tab, accelerator="Ctrl+W")
+        filemenu.add_command(label="Close All Tabs", command=self.close_all_tabs)
         filemenu.add_separator()
         filemenu.add_command(label="Export Measurements (CSV)...",
                               command=lambda: self._dispatch("export_csv"))
@@ -3187,26 +3260,72 @@ class App:
         self.toolbar_bar = bar
         bar_window = canvas.create_window((0, 0), window=bar, anchor="nw")
 
-        def _sync_toolbar_layout(event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"),
+        # _sync_toolbar_layout decides whether the scrollbar needs to be
+        # shown, by comparing how wide `bar`'s content actually needs to
+        # be (winfo_reqwidth()) against how wide the canvas viewport
+        # currently is.
+        #
+        # THE REAL BUG (found after `bar.bind("<Configure>", ...)` alone
+        # turned out not to be enough, even with fresh/settled reads):
+        # `bar`'s on-screen width is PINNED by `canvas.itemconfigure(...,
+        # width=...)` below, once that's ever been set -- so `bar` no
+        # longer auto-resizes to fit its own content the way a normally
+        # packed/gridded frame would. That means `bar`'s <Configure> only
+        # ever fires for the very first layout (before anything has
+        # pinned its width yet) or when WE explicitly change that pinned
+        # width ourselves -- never just because a child's own content
+        # changed size (e.g. the Make Parallel hint label growing or
+        # shrinking its text) without the window itself being resized.
+        # `canvas`'s own <Configure> only fires on an actual window
+        # resize for the same reason. So a pure content-size change,
+        # exactly the "options are off screen" scenario, was never
+        # reaching this sync logic AT ALL -- not a timing/staleness
+        # problem, a "nothing ever asked" problem. Fixed by also calling
+        # self._schedule_toolbar_sync() explicitly from
+        # refresh_toolbar_hint(), the only place button/label text
+        # changes after the initial build, any time it changes what's
+        # shown.
+        #
+        # Kept as a debounced after_idle callback (rather than computing
+        # synchronously inside whatever triggered it) regardless, since a
+        # widget's requested size is really only guaranteed accurate once
+        # Tk's own idle-time geometry recomputation has finished, and
+        # this coalesces bursts of triggers (e.g. a resize drag) into one
+        # actual layout pass.
+        self._toolbar_sync_job = None
+
+        def _sync_toolbar_layout():
+            self._toolbar_sync_job = None
+            req_w = bar.winfo_reqwidth()
+            canvas.configure(scrollregion=(0, 0, req_w, bar.winfo_reqheight()),
                               height=bar.winfo_reqheight())
-            if bar.winfo_reqwidth() > canvas.winfo_width():
+            # Let the embedded row match the canvas's width when there's
+            # room to spare, but never shrink it below what its content
+            # actually needs -- that's what makes it scroll instead of
+            # squashing the buttons once the window gets narrow. Doing
+            # this here (instead of separately, from canvas's own
+            # <Configure>) means it always uses the same freshly-settled
+            # req_w as the show/hide decision right below it.
+            canvas.itemconfigure(bar_window, width=max(canvas.winfo_width(), req_w))
+            if req_w > canvas.winfo_width():
                 if not hscroll.winfo_ismapped():
                     hscroll.pack(side="top", fill="x")
             elif hscroll.winfo_ismapped():
                 hscroll.pack_forget()
                 canvas.xview_moveto(0)
 
-        def _sync_canvas_item_width(event):
-            # Let the embedded row match the canvas's width when there's
-            # room to spare, but never shrink it below what its content
-            # actually needs -- that's what makes it scroll instead of
-            # squashing the buttons once the window gets narrow.
-            canvas.itemconfigure(bar_window, width=max(event.width, bar.winfo_reqwidth()))
-            _sync_toolbar_layout()
+        def _schedule_toolbar_sync(event=None):
+            if self._toolbar_sync_job is not None:
+                self.root.after_cancel(self._toolbar_sync_job)
+            self._toolbar_sync_job = self.root.after_idle(_sync_toolbar_layout)
 
-        bar.bind("<Configure>", _sync_toolbar_layout)
-        canvas.bind("<Configure>", _sync_canvas_item_width)
+        # Exposed on self so refresh_toolbar_hint (the only other place
+        # that changes toolbar content after this initial build) can
+        # trigger a re-check explicitly -- see the comment above.
+        self._schedule_toolbar_sync = _schedule_toolbar_sync
+
+        bar.bind("<Configure>", _schedule_toolbar_sync)
+        canvas.bind("<Configure>", _schedule_toolbar_sync)
 
         def _on_toolbar_wheel(event):
             canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
@@ -3250,6 +3369,7 @@ class App:
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="New Tab", command=self.new_tab).pack(side="left", padx=2)
         ttk.Button(bar, text="Close Tab \u2715", command=self.close_active_tab).pack(side="left", padx=2)
+        ttk.Button(bar, text="Close All Tabs", command=self.close_all_tabs).pack(side="left", padx=2)
         # ttk.Notebook doesn't scroll or wrap when there are more tabs than
         # fit the window -- it just clips the overflow ones with no way to
         # click them -- so this dropdown is the fallback that always reaches
@@ -3419,6 +3539,39 @@ class App:
         if not self.notebook.tabs():
             self.new_tab()
 
+    def close_all_tabs(self):
+        """Close every open tab at once -- asks ONCE up front if any of
+        them have unsaved changes (rather than the usual one-dialog-per-
+        tab from Close Tab), since confirming N times in a row for one
+        button press would be tedious. Always leaves one fresh blank tab
+        behind, same as closing the very last tab normally does."""
+        if not self._confirm_discard_all_tabs(
+                "Close all tabs?"):
+            return
+        self._close_all_tabs_unconditionally()
+
+    def _confirm_discard_all_tabs(self, heading):
+        """Shared by Close All Tabs and Open Workspace (which also has to
+        get rid of every currently-open tab before loading the new set) --
+        skips the dialog entirely when nothing would actually be lost."""
+        dirty_tabs = [t for t in self._all_tabs() if t.dirty]
+        if not dirty_tabs:
+            return True
+        names = ", ".join(f'"{t.display_name()}"' for t in dirty_tabs)
+        plural = "s have" if len(dirty_tabs) != 1 else " has"
+        return messagebox.askyesno(
+            "Unsaved changes",
+            f"{heading}\n\n"
+            f"{len(dirty_tabs)} tab{plural} measurements that were never saved "
+            f"as a project file or a workspace: {names}.\n\n"
+            "Continue and lose those changes?")
+
+    def _close_all_tabs_unconditionally(self):
+        for tab in self._all_tabs():
+            self.notebook.forget(tab)
+            tab.destroy()
+        self.new_tab()
+
     def _on_notebook_tab_closed(self, event=None):
         idx = self.notebook.last_closed_index
         if idx is None:
@@ -3522,6 +3675,45 @@ class App:
                          f"{'snaps to nearby lines/vertices' if self.snap_mode.get() else 'no longer snaps'}.")
         return "break"
 
+    def _fit_to_window_shortcut(self, event=None):
+        """Space zooms/pans the active tab's photo to fit the window --
+        same as clicking the toolbar's Fit button -- guarded the same way
+        as 'P'/'S' so a space typed into a text field (or a button that
+        happens to have focus, where Space normally activates it) isn't
+        hijacked."""
+        tab = self.active_tab()
+        if tab is None:
+            return None
+        guarded = (tab.known_length_entry, tab.known_unit_box, tab.display_mode_box,
+                   tab.display_unit_box, tab.display_denominator_box)
+        focused = self.root.focus_get()
+        if focused in guarded or isinstance(focused, (tk.Button, ttk.Button, ttk.Checkbutton)):
+            return None
+        tab.fit_to_window()
+        tab.redraw()
+        self.set_status("Fit to window.")
+        return "break"
+
+    def _switch_tab_shortcut(self, direction):
+        """Left/Right arrow keys switch to the previous/next tab (wrapping
+        around at either end) -- guarded against any focused text/combo
+        field, where Left/Right obviously mean "move the cursor" or
+        "change the dropdown selection", not "switch tabs". The Measured
+        Lines list (a flat Treeview, no nested rows) is deliberately NOT
+        guarded here -- clicking a line in that list only ever uses
+        Up/Down to move between rows, never Left/Right, so after clicking
+        a row there Left/Right should still switch tabs immediately rather
+        than needing an extra click elsewhere first."""
+        focused = self.root.focus_get()
+        if isinstance(focused, (ttk.Entry, tk.Entry, ttk.Combobox, tk.Spinbox)):
+            return None
+        tabs = self.notebook.tabs()
+        if len(tabs) < 2:
+            return None
+        idx = self.notebook.index(self.notebook.select())
+        self.notebook.select(tabs[(idx + direction) % len(tabs)])
+        return "break"
+
     def _dispatch(self, method_name, *args):
         tab = self.active_tab()
         if tab is None:
@@ -3552,6 +3744,14 @@ class App:
                 ref_label = f"#{ln.id} ({ln.color})" if ln else "?"
                 self.parallel_hint.config(
                     text=f"Make Parallel: click the line to make parallel to {ref_label}")
+            # The button/hint text just changed, which can change how wide
+            # the toolbar's content needs to be -- but `bar` (the toolbar's
+            # embedded row) doesn't auto-fire its own <Configure> just from
+            # a child's content changing (see the comment in
+            # _build_toolbar on why), so the scrollbar show/hide check
+            # would otherwise never be told about it. Ask for it
+            # explicitly every time this method changes the text.
+            self._schedule_toolbar_sync()
             return
         self.parallel_button.config(text="Make Parallel (P)")
         ref = tab._parallel_reference()
@@ -3560,6 +3760,7 @@ class App:
                 text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
         else:
             self.parallel_hint.config(text="")
+        self._schedule_toolbar_sync()
 
     def _build_tabs_menu(self):
         """Every open tab, by name -- including ones whose on-screen tab
@@ -3591,14 +3792,36 @@ class App:
         fresh tab again if loading was cancelled/failed."""
         candidate = prefer_tab or self.active_tab()
         reuse = candidate is not None and candidate.is_blank()
+        previous = None if reuse else self._safe_selected_tab_name()
         target = candidate if reuse else self.new_tab(focus=False)
+        if not reuse:
+            # Select (map) the fresh tab BEFORE loading into it. The
+            # loader's fit-to-window call needs the canvas's real on-
+            # screen size, which Tk only reports for the currently-
+            # selected notebook page -- a still-unselected tab reports a
+            # tiny placeholder size instead, so an image dropped or opened
+            # into a fresh tab was silently fitting itself to that instead
+            # of the real window, i.e. loading small.
+            self.notebook.select(target)
+            self.root.update_idletasks()
         ok = loader(target)
         if ok:
             self.notebook.select(target)
         elif not reuse:
             self.notebook.forget(target)
             target.destroy()
+            if previous is not None:
+                try:
+                    self.notebook.select(previous)
+                except tk.TclError:
+                    pass
         return ok
+
+    def _safe_selected_tab_name(self):
+        try:
+            return self.notebook.select() or None
+        except tk.TclError:
+            return None
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -3609,20 +3832,269 @@ class App:
             return
         self._open_into_tab(lambda tab: tab.load_image_path(path))
 
-    def open_project(self):
-        path = filedialog.askopenfilename(
-            title="Open project",
-            filetypes=[("Image Measure project", f"*{PROJECT_EXT} *{LEGACY_PROJECT_EXT}"),
-                       ("All files", "*.*")])
+    # -------------------------------------------------------------- open...
+    # One unified "Open..." for both a .imt project AND a .imtw workspace
+    # (Nick: "there should not be a difference between open project or open
+    # workspace, i just want one open command") -- a TIA-Portal-style
+    # Recently Used list, since open_path() already tells the two apart by
+    # extension, so nothing here has to ask which kind you're picking.
+    def _load_recent_files(self):
+        try:
+            with open(RECENT_FILES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [p for p in data.get("paths", []) if isinstance(p, str)]
+        except Exception:
+            return []
+
+    def _save_recent_files(self, paths):
+        try:
+            os.makedirs(os.path.dirname(RECENT_FILES_PATH), exist_ok=True)
+            tmp = RECENT_FILES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"paths": paths}, f, indent=2)
+            os.replace(tmp, RECENT_FILES_PATH)
+        except Exception:
+            pass  # best-effort -- a broken recent-files list should never break opening/saving
+
+    def _record_recent_file(self, path):
+        """Add/move `path` to the front of the Open... dialog's recently-
+        used list -- deduped, capped, newest first. Called whenever a
+        project or workspace is successfully opened OR saved."""
         if not path:
             return
-        self._open_into_tab(lambda tab: tab.load_project_data(path))
+        paths = [p for p in self._load_recent_files() if p != path]
+        paths.insert(0, path)
+        self._save_recent_files(paths[:MAX_RECENT_FILES])
+
+    def open_recent_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Open")
+        dialog.transient(self.root)
+        if self.open_dialog_geometry:
+            self._apply_saved_geometry(self.open_dialog_geometry, widget=dialog)
+        else:
+            dialog.geometry("720x420")
+        dialog.minsize(480, 280)
+
+        def close_dialog():
+            # Remembered (session.json, same as the main window's own size
+            # and position) so the dialog reopens where you left it instead
+            # of the same default spot every time.
+            try:
+                self.open_dialog_geometry = dialog.geometry()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Recently used", font=("", 10, "bold")).pack(
+            anchor="w", pady=(0, 6))
+
+        tree_frame = ttk.Frame(outer)
+        tree_frame.pack(fill="both", expand=True)
+        columns = ("name", "path", "changed")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                             selectmode="browse")
+        tree.heading("name", text="Name")
+        tree.heading("path", text="Path")
+        tree.heading("changed", text="Last change")
+        tree.column("name", width=200, anchor="w")
+        tree.column("path", width=340, anchor="w")
+        tree.column("changed", width=140, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def populate():
+            tree.delete(*tree.get_children())
+            for path in self._load_recent_files():
+                name = os.path.splitext(os.path.basename(path))[0]
+                try:
+                    changed = time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(os.path.getmtime(path)))
+                except OSError:
+                    changed = "(file not found)"
+                tree.insert("", "end", iid=path, values=(name, path, changed))
+
+        def do_open(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            path = sel[0]
+            if not os.path.exists(path):
+                messagebox.showerror(
+                    "File not found",
+                    f"Couldn't find:\n{path}\n\nIt may have been moved or deleted.")
+                return
+            close_dialog()
+            self.open_path(path)
+
+        def remove_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            remaining = [p for p in self._load_recent_files() if p not in sel]
+            self._save_recent_files(remaining)
+            populate()
+
+        def browse():
+            path = filedialog.askopenfilename(
+                title="Open",
+                filetypes=[("Image Measure project or workspace",
+                            f"*{PROJECT_EXT} *{WORKSPACE_EXT} *{LEGACY_PROJECT_EXT}"),
+                           ("All files", "*.*")])
+            if not path:
+                return
+            close_dialog()
+            self.open_path(path)
+
+        populate()
+        tree.bind("<Double-1>", do_open)
+
+        btn_frame = ttk.Frame(outer)
+        btn_frame.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_frame, text="Browse...", command=browse).pack(side="left")
+        ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(btn_frame, text="Cancel", command=close_dialog).pack(side="right")
+        ttk.Button(btn_frame, text="Open", command=do_open).pack(side="right", padx=(0, 6))
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
 
     def handle_dropped_file(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_image_path(path), prefer_tab=source_tab)
 
     def handle_dropped_project(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_project_data(path), prefer_tab=source_tab)
+
+    def handle_dropped_workspace(self, path):
+        # A workspace replaces ALL open tabs (see _open_workspace_path), so
+        # which tab it was dropped onto doesn't matter here.
+        self._open_workspace_path(path)
+
+    # ------------------------------------------------------------ workspace
+    # A workspace (.imtw, File > Save All Tabs) is one file holding EVERY
+    # open tab at once -- each tab's data is written the same way a single
+    # .imt project is (including its own embedded copy of the image, so the
+    # whole workspace stays portable even off this machine) -- so opening
+    # it again reopens every tab in exactly the state it was saved in.
+    def save_workspace(self):
+        if self.workspace_path:
+            self._write_workspace(self.workspace_path)
+        else:
+            self.save_workspace_as()
+
+    def save_workspace_as(self):
+        savable = [t for t in self._all_tabs() if not t.is_blank()]
+        if not savable:
+            messagebox.showinfo("Nothing to save", "Open at least one image first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save all tabs as a workspace",
+            defaultextension=WORKSPACE_EXT,
+            filetypes=[("Image Measure workspace", f"*{WORKSPACE_EXT}")])
+        if not path:
+            return
+        self.workspace_path = path
+        self._write_workspace(path)
+
+    def _write_workspace(self, path):
+        savable = [t for t in self._all_tabs() if not t.is_blank()]
+        if not savable:
+            messagebox.showinfo("Nothing to save", "Open at least one image first.")
+            return
+        active_tab = self.active_tab()
+        active_index = savable.index(active_tab) if active_tab in savable else 0
+
+        tabs_data = []
+        for t in savable:
+            image_data_b64 = None
+            if t.image_bytes_cache:
+                image_data_b64 = base64.b64encode(t.image_bytes_cache).decode("ascii")
+            tabs_data.append({
+                "image_path": t.image_path,
+                "image_data": image_data_b64,
+                "rotation_turns": t.rotation_turns,
+                "scale": t.scale,
+                "view_x": t.view_x,
+                "view_y": t.view_y,
+                "lines": [ln.to_dict() for ln in t.lines],
+                "ellipses": [el.to_dict() for el in t.ellipses],
+                "axis_display_mode": t.axis_display_mode,
+            })
+        data = {"version": 1, "active_index": active_index, "tabs": tabs_data}
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            messagebox.showerror("Could not save workspace", str(exc))
+            return
+
+        self.workspace_path = path
+        for t in savable:
+            t.dirty = False
+            self.update_tab_title(t)
+        self._record_recent_file(path)
+        size_kb = os.path.getsize(path) // 1024
+        self.set_status(f"Saved {len(tabs_data)} tab(s) to workspace "
+                         f"{os.path.basename(path)} ({size_kb:,} KB).")
+
+    def open_workspace(self):
+        path = filedialog.askopenfilename(
+            title="Open a workspace (all tabs)",
+            filetypes=[("Image Measure workspace", f"*{WORKSPACE_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self._open_workspace_path(path)
+
+    def _open_workspace_path(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Could not open workspace", str(exc))
+            return
+        entries = data.get("tabs", [])
+        if not entries:
+            messagebox.showinfo("Empty workspace",
+                                 "That workspace file doesn't have any tabs saved in it.")
+            return
+
+        # Opening a workspace replaces every currently-open tab -- same
+        # "you're about to lose this" check Close All Tabs uses.
+        if not self._confirm_discard_all_tabs(
+                "Opening this workspace will close all your current tabs first."):
+            return
+        for tab in self._all_tabs():
+            self.notebook.forget(tab)
+            tab.destroy()
+
+        notes = []
+        for entry in entries:
+            tab, title, note = self._build_tab_from_entry(entry)
+            if note:
+                notes.append(note)
+            self.notebook.add(tab, text=title)
+
+        self.workspace_path = path
+        self._record_recent_file(path)
+        idx = data.get("active_index", 0)
+        tabs = self.notebook.tabs()
+        if 0 <= idx < len(tabs):
+            self.notebook.select(tabs[idx])
+        msg = f"Opened {len(tabs)} tab(s) from workspace {os.path.basename(path)}."
+        if notes:
+            msg += " " + "; ".join(notes) + "."
+        self.set_status(msg)
 
     # -------------------------------------------------------------- session
     def _all_tabs(self):
@@ -3636,10 +4108,18 @@ class App:
             tabs = self._all_tabs()
             tabs_data = [t.snapshot() for t in tabs]
             active = self.notebook.index(self.notebook.select()) if tabs else 0
+            try:
+                window_state = self.root.state()
+            except tk.TclError:
+                window_state = "normal"
             data = {"version": 1, "active_index": active, "tabs": tabs_data,
                     "default_unit": self.default_unit.get(),
                     "fraction_denominator": self.fraction_denominator.get(),
-                    "default_display_mode": self.default_display_mode.get()}
+                    "default_display_mode": self.default_display_mode.get(),
+                    "window_geometry": self.root.geometry(),
+                    "window_state": window_state,
+                    "snap_mode": self.snap_mode.get(),
+                    "open_dialog_geometry": self.open_dialog_geometry}
             os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
             tmp = SESSION_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -3647,6 +4127,143 @@ class App:
             os.replace(tmp, SESSION_PATH)
         except Exception:
             pass
+
+    def _virtual_screen_bounds(self):
+        """The bounding box of ALL connected monitors combined, as
+        (left, top, right, bottom). winfo_screenwidth/height only ever
+        report the PRIMARY monitor's size -- on a multi-monitor setup, a
+        saved window position on a secondary monitor (very often placed to
+        the right of or above/below the primary one, i.e. with a negative
+        or >primary-width coordinate) would look "off-screen" to that
+        check even though it's perfectly reachable, which was silently
+        discarding the saved position on every close/reopen for anyone
+        using more than one monitor. On Windows, ask the OS directly for
+        the true virtual-desktop bounds; everywhere else, fall back to the
+        single-monitor size (no worse than before)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+                gsm = ctypes.windll.user32.GetSystemMetrics
+                left, top = gsm(SM_XVIRTUALSCREEN), gsm(SM_YVIRTUALSCREEN)
+                width, height = gsm(SM_CXVIRTUALSCREEN), gsm(SM_CYVIRTUALSCREEN)
+                if width > 0 and height > 0:
+                    return left, top, left + width, top + height
+            except Exception:
+                pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _apply_saved_geometry(self, geom, widget=None):
+        """Restore `widget` (the main window by default, but also used for
+        the Open... dialog -- see open_recent_dialog) to a saved
+        size+position -- but only the position if it would still land at
+        least partly on a currently-connected screen (across ALL monitors,
+        see _virtual_screen_bounds). Without this check, a saved position
+        from a monitor that's since been unplugged (or a resolution that's
+        changed) would leave the window opening off-screen where it can't
+        be reached -- so in that case just the SIZE is restored, and the
+        window manager picks a normal default position instead."""
+        widget = widget if widget is not None else self.root
+        m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geom)
+        if not m:
+            return
+        w, h, x, y = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        left, top, right, bottom = self._virtual_screen_bounds()
+        # A generous margin beyond the exact bounds, so a window that's
+        # mostly (but not perfectly) on-screen -- e.g. a few pixels of
+        # title bar poking past a monitor's edge -- still counts.
+        margin = 100
+        on_screen = (left - margin <= x <= right - margin and
+                     top - margin <= y <= bottom - margin)
+        try:
+            if on_screen:
+                widget.geometry(geom)
+            else:
+                widget.geometry(f"{w}x{h}")
+        except tk.TclError:
+            pass
+
+    def _build_tab_from_entry(self, entry):
+        """Build one fresh ProjectTab from a saved per-tab dict -- shared by
+        the session.json autosave restore AND Open Workspace (.imtw)
+        loading, so both behave identically. Always returns a (tab, title,
+        note) triple -- even on total failure it still returns a blank
+        placeholder tab (never silently drops one, so you don't lose track
+        of "I had N tabs, now there's N-1") -- the caller is responsible
+        for actually adding it to the notebook.
+
+        Tries, in order, to get the image's raw bytes from: the live file
+        at image_path (freshest, if it hasn't moved); "image_data" embedded
+        directly in the entry itself (present in .imtw workspace files,
+        which is what keeps THOSE fully portable even off this machine);
+        then the copy embedded in project_path's own .imt file (present
+        only for a tab that was ever explicitly Saved as a Project -- this
+        is the fallback session.json restore has always used, since
+        session.json itself never embeds image bytes, to keep the autosave
+        file small)."""
+        tab = ProjectTab(self.notebook, self)
+        title = "Untitled"
+        note = None
+        img_path = entry.get("image_path")
+        project_path = entry.get("project_path")
+        rotation_turns = entry.get("rotation_turns", 0)
+
+        raw = None
+        recovered_from = None
+        if img_path and os.path.exists(img_path):
+            try:
+                with open(img_path, "rb") as f:
+                    raw = f.read()
+            except Exception:
+                raw = None
+        if raw is None and entry.get("image_data"):
+            try:
+                raw = base64.b64decode(entry["image_data"])
+            except Exception:
+                raw = None
+            if raw is not None:
+                recovered_from = "recovered from its embedded copy"
+        if raw is None and project_path and os.path.exists(project_path):
+            raw = _embedded_bytes_from_project_file(project_path)
+            if raw is not None:
+                recovered_from = "recovered from its saved project file"
+
+        ok = False
+        if raw is not None:
+            try:
+                tab._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
+                ok = True
+            except Exception:
+                ok = False
+
+        if ok:
+            tab.image_path = img_path
+            tab.project_path = project_path
+            tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
+            tab.ellipses = [Ellipse.from_dict(d) for d in entry.get("ellipses", [])]
+            tab.selected_line_ids = []
+            saved_modes = entry.get("axis_display_mode") or {}
+            tab.axis_display_mode = {
+                color: saved_modes.get(color) for color in AXIS_COLORS}
+            if entry.get("scale"):
+                tab.scale = entry["scale"]
+                tab.view_x = entry.get("view_x", tab.view_x)
+                tab.view_y = entry.get("view_y", tab.view_y)
+                tab._render_image()
+            else:
+                tab.fit_to_window()
+            tab.dirty = False
+            tab._clear_placeholder()
+            tab.redraw()
+            title = tab.display_name()
+            self.update_tab_title(tab)
+            if recovered_from:
+                note = f"'{title}' had moved -- {recovered_from}"
+        elif img_path:
+            note = f"couldn't find '{os.path.basename(img_path)}' -- that tab is blank"
+
+        return tab, title, note
 
     def _restore_session(self):
         if not os.path.exists(SESSION_PATH):
@@ -3663,66 +4280,28 @@ class App:
             self.fraction_denominator.set(data["fraction_denominator"])
         if data.get("default_display_mode") in DISPLAY_MODE_CHOICES:
             self.default_display_mode.set(data["default_display_mode"])
+        if isinstance(data.get("snap_mode"), bool):
+            self.snap_mode.set(data["snap_mode"])
+        if data.get("open_dialog_geometry"):
+            self.open_dialog_geometry = data["open_dialog_geometry"]
+        if data.get("window_geometry"):
+            self._apply_saved_geometry(data["window_geometry"])
+        if data.get("window_state") == "zoomed":
+            # Applied AFTER the geometry above, so the window is already
+            # positioned on the right monitor before maximizing onto it --
+            # maximize alone (without first placing it there) would just
+            # zoom onto whichever monitor Windows opened it on by default.
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
 
         restored_any = False
         notes = []
         for entry in data.get("tabs", []):
-            tab = ProjectTab(self.notebook, self)
-            title = "Untitled"
-            img_path = entry.get("image_path")
-            project_path = entry.get("project_path")
-            rotation_turns = entry.get("rotation_turns", 0)
-
-            # Get the image's raw bytes from wherever they're still available:
-            # the live file first, and -- if that's gone (moved/deleted) but
-            # this tab was ever saved as a project -- the copy embedded in
-            # that .imt file, same as opening the project directly would.
-            raw = None
-            recovered_via_project = False
-            if img_path and os.path.exists(img_path):
-                try:
-                    with open(img_path, "rb") as f:
-                        raw = f.read()
-                except Exception:
-                    raw = None
-            if raw is None and project_path and os.path.exists(project_path):
-                raw = _embedded_bytes_from_project_file(project_path)
-                recovered_via_project = raw is not None
-
-            ok = False
-            if raw is not None:
-                try:
-                    tab._apply_loaded_bytes(raw, rotation_turns=rotation_turns)
-                    ok = True
-                except Exception:
-                    ok = False
-
-            if ok:
-                tab.image_path = img_path
-                tab.project_path = project_path
-                tab.lines = [Line.from_dict(d) for d in entry.get("lines", [])]
-                tab.ellipses = [Ellipse.from_dict(d) for d in entry.get("ellipses", [])]
-                tab.selected_line_ids = []
-                saved_modes = entry.get("axis_display_mode") or {}
-                tab.axis_display_mode = {
-                    color: saved_modes.get(color) for color in AXIS_COLORS}
-                if entry.get("scale"):
-                    tab.scale = entry["scale"]
-                    tab.view_x = entry.get("view_x", tab.view_x)
-                    tab.view_y = entry.get("view_y", tab.view_y)
-                    tab._render_image()
-                else:
-                    tab.fit_to_window()
-                tab.dirty = False
-                tab._clear_placeholder()
-                tab.redraw()
-                title = tab.display_name()
-                self.update_tab_title(tab)
-                if recovered_via_project:
-                    notes.append(f"'{title}' had moved -- recovered from its saved project file")
-            elif img_path:
-                notes.append(f"couldn't find '{os.path.basename(img_path)}' -- that tab is blank")
-
+            tab, title, note = self._build_tab_from_entry(entry)
+            if note:
+                notes.append(note)
             self.notebook.add(tab, text=title)
             restored_any = True
 
@@ -3741,18 +4320,205 @@ class App:
         self.save_session()
         self.root.after(SESSION_AUTOSAVE_MS, self._periodic_autosave)
 
+    # ------------------------------------------------------ single instance
+    def _start_single_instance_listener(self):
+        """Best-effort: starts a background thread listening on
+        SINGLE_INSTANCE_ADDRESS for a path handed over by a LATER launch of
+        the app (see _forward_to_running_instance/main), so double-clicking
+        another .imt/.imtw file while this window is already open lands in
+        THIS window instead of opening a duplicate. Never raises -- a
+        machine where the IPC channel can't be created (permissions, a
+        stale socket, whatever) should still run the app normally, just
+        without that convenience."""
+        self._single_instance_listener = None
+        self._single_instance_stop = False
+        try:
+            if sys.platform != "win32" and os.path.exists(SINGLE_INSTANCE_ADDRESS):
+                # A Unix socket path left behind by a crash -- Windows named
+                # pipes have no such file to clean up.
+                os.remove(SINGLE_INSTANCE_ADDRESS)
+            listener = Listener(SINGLE_INSTANCE_ADDRESS, authkey=SINGLE_INSTANCE_AUTHKEY)
+        except Exception:
+            return
+        self._single_instance_listener = listener
+        thread = threading.Thread(target=self._single_instance_loop, args=(listener,), daemon=True)
+        thread.start()
+
+    def _single_instance_loop(self, listener):
+        # Runs on a background thread for the app's whole lifetime --
+        # accept() blocks until another launch connects (or the listener
+        # is closed by on_app_close, which raises here and ends the loop).
+        while not self._single_instance_stop:
+            try:
+                conn = listener.accept()
+            except Exception:
+                return
+            try:
+                msg = conn.recv()
+            except Exception:
+                msg = None
+            finally:
+                conn.close()
+            if isinstance(msg, dict) and msg.get("cmd") == "open":
+                paths = msg.get("paths") or []
+                # Tkinter isn't thread-safe -- marshal the actual open back
+                # onto the main thread instead of touching the UI here.
+                self.root.after(0, self._handle_external_open, paths)
+
+    def _handle_external_open(self, paths):
+        try:
+            self.root.deiconify()
+        except tk.TclError:
+            pass
+        self.root.lift()
+        self.root.focus_force()
+        for path in paths:
+            self.open_path(path)
+
+    def open_path(self, path):
+        """Open a single path -- an image, a .imt project, or a .imtw
+        workspace -- whichever it is, by extension. Reuses an already-open
+        tab/workspace for that exact path instead of duplicating it. This
+        is what a normal double-click-to-open funnels through AND what an
+        incoming single-instance request (see _handle_external_open)
+        funnels through, so both behave identically."""
+        lower = path.lower()
+        if lower.endswith(WORKSPACE_EXT):
+            self._open_workspace_path(path)
+            return
+        if lower.endswith(PROJECT_EXT) or lower.endswith(LEGACY_PROJECT_EXT):
+            for tab in self._all_tabs():
+                if tab.project_path == path:
+                    self.notebook.select(tab)
+                    self._record_recent_file(path)
+                    return
+            self._open_into_tab(lambda tab: tab.load_project_data(path))
+            return
+        if lower.endswith(IMAGE_EXTS):
+            for tab in self._all_tabs():
+                if tab.image_path == path and tab.project_path is None:
+                    self.notebook.select(tab)
+                    return
+            self._open_into_tab(lambda tab: tab.load_image_path(path))
+            return
+        messagebox.showinfo(
+            "Not recognized",
+            "Don't know how to open this file -- expected an image "
+            "(jpg/png/bmp/tif/webp), a project "
+            f"({PROJECT_EXT}), or a workspace ({WORKSPACE_EXT}).")
+
     def on_app_close(self):
         self.save_session()
+        self._single_instance_stop = True
+        listener = getattr(self, "_single_instance_listener", None)
+        if listener is not None:
+            try:
+                listener.close()
+            except Exception:
+                pass
         self.root.destroy()
 
 
+def _make_dpi_aware():
+    """Windows only: tell the OS this process handles its own DPI scaling,
+    BEFORE any window is created. Without this, Windows silently scales
+    every coordinate Tk sees (winfo_screenwidth/height, root.geometry(),
+    GetSystemMetrics(SM_C*VIRTUALSCREEN)...) through a per-monitor "virtual"
+    factor -- which lines up fine on a single monitor, but on a multi-
+    monitor setup where the monitors use DIFFERENT scaling percentages
+    (e.g. a 150% laptop panel next to a 100% external display, a very
+    common combination), Tk's idea of where the window is and Windows'
+    idea of where the monitors are stop agreeing, so the saved-position
+    on-screen check (see App._virtual_screen_bounds) can reject a
+    perfectly valid position, or place the restored window on the wrong
+    monitor, or at the wrong size. Declaring per-monitor DPI awareness
+    makes all of those coordinates consistent, physical pixels throughout.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()  # older Windows fallback
+        except Exception:
+            pass
+
+
+def register_file_association():
+    """Windows only, and only for the BUILT exe (PyInstaller sets
+    sys.frozen) -- silently (re-)registers this app as the default handler
+    for both .imt and .imtw, every time the built exe starts. Written to
+    HKEY_CURRENT_USER (the per-user registry hive), which needs no admin
+    rights and still shows up in Explorer's "Open with" for the current
+    user. Running from source (`python image_measure_tool.py`) never
+    touches the registry -- there's no stable, permanent exe path to point
+    it at in that case, and silently claiming a file association while
+    just developing would be a bad surprise."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import winreg
+        exe = sys.executable
+        command = f'"{exe}" "%1"'
+        for ext, prog_id, description in (
+            (PROJECT_EXT, "ImageMeasureTool.Project", "Image Measure Tool Project"),
+            (WORKSPACE_EXT, "ImageMeasureTool.Workspace", "Image Measure Tool Workspace"),
+        ):
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{prog_id}") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, description)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{prog_id}\\shell\\open\\command") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, command)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   f"Software\\Classes\\{ext}") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, prog_id)
+    except Exception:
+        pass  # best-effort -- a broken registry write should never stop the app from starting
+
+
+def _forward_to_running_instance(paths):
+    """Try to hand `paths` off to an already-running instance over the
+    single-instance IPC channel. Returns True if that succeeded (the
+    caller should exit immediately without opening a second window), False
+    if nothing's listening (the caller should become the primary instance
+    itself, and open `paths` in its own new window)."""
+    if not paths:
+        return False
+    try:
+        conn = Client(SINGLE_INSTANCE_ADDRESS, authkey=SINGLE_INSTANCE_AUTHKEY)
+        try:
+            conn.send({"cmd": "open", "paths": paths})
+        finally:
+            conn.close()
+        return True
+    except Exception:
+        return False
+
+
 def main():
+    _make_dpi_aware()
+    # argv[1:] is whatever file Explorer double-clicked/"Open with"-ed this
+    # launch with (via the association register_file_association sets up),
+    # if any -- ignore stray flag-looking args rather than choking on them.
+    incoming_paths = [p for p in sys.argv[1:] if p and not p.startswith("-")]
+    if incoming_paths and _forward_to_running_instance(incoming_paths):
+        # Handed off to the window that's already open -- this launch's
+        # only job was to deliver the file, so it's done.
+        return
+
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
     try:
         ttk.Style().theme_use("clam")
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+    register_file_association()
+    for path in incoming_paths:
+        app.open_path(path)
     root.mainloop()
 
 

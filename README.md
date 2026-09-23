@@ -44,11 +44,21 @@ taskbar entry while running).
   **File > Open Image** (Ctrl+O) starts another; the small **✕** on a tab
   closes it (middle-click a tab, or Ctrl+W / File > Close Tab, do the same
   thing). If a tab has measurements that were never saved as a project
-  file, closing it asks you to confirm first.
+  file (or a workspace -- see below), closing it asks you to confirm first.
+- **Close All Tabs** (toolbar button, or File menu) closes every open tab
+  at once, leaving one fresh blank tab behind. If any of them have unsaved
+  measurements, it asks ONCE up front (naming which tabs), rather than one
+  confirmation per tab.
 - The **Tabs ▾** button in the toolbar, next to New Tab and Close Tab, lists
   every open tab by name (with a ✓ on whichever one's active) so you can
   jump straight to one even if it's been clipped off-screen by a narrow
   window or a lot of open tabs.
+- Press the **Left/Right arrow keys** to switch to the previous/next tab
+  (wrapping around at either end), without reaching for the mouse or the
+  Tabs ▾ menu. This is suppressed while a text field or dropdown has focus,
+  so the arrow keys keep their normal job there (moving the cursor,
+  changing a dropdown selection) -- but works fine right after clicking a
+  line in the Measured Lines list, since that list only ever uses Up/Down.
 - The color/mode toolbar at the top and the Edit menu always act on
   whichever tab is currently in front.
 - The toolbar itself scrolls horizontally rather than clipping buttons at a
@@ -57,14 +67,72 @@ taskbar entry while running).
   grab the scrollbar itself), so every button stays reachable no matter
   how small the window gets. It disappears again once the window's wide
   enough that nothing overflows.
-- Drag either an image **or a `.imt` project file** onto a tab to open it --
-  same rule either way: onto a tab that already has something open, it
-  loads into a **new** tab; onto an empty tab, it loads right there.
+- Drag an image, a `.imt` project file, **or a `.imtw` workspace file**
+  onto a tab to open it. An image or a project loads into a **new** tab if
+  the one you dropped it on already has something open (or right into that
+  tab if it was empty). A workspace is different -- since it holds a whole
+  set of tabs at once, dropping one always replaces **every** currently
+  open tab with the ones from the file (asking first if that would lose
+  unsaved work), the same as `File > Open Workspace`.
+
+## Opening a project or workspace (File > Open)
+
+`File > Open` (**Ctrl+Shift+O**) is the one command for opening EITHER a
+`.imt` project or a `.imtw` workspace -- there's no separate "Open Project"
+vs "Open Workspace", since the file itself already says which one it is. It
+shows a Recently Used list (name, full path, and the file's last-modified
+time), newest first -- click a row and **Open** (or just double-click it)
+to open that exact file, **Remove** to drop an entry you don't want
+cluttering the list anymore (without touching the file itself), or
+**Browse...** to pick a file that isn't in the list yet. Opening something
+from here goes through the same logic as double-clicking the file in
+Explorer or dragging it onto the app (see below), so a project switches
+to/reopens its tab and a workspace replaces all your tabs the same way
+either time. Every project or workspace you open OR save gets added to this
+list automatically.
+
+The dialog also remembers its own size and position, separately from the
+main window -- resize or move it, and it reopens at that same size and
+spot next time, whether you closed it by opening a file, Cancel, or the
+window's own close button.
+
+**Save All Tabs** (the workspace save, `File > Save All Tabs`) has its own
+shortcut too: **Ctrl+Shift+S**.
+
+## Opening `.imt`/`.imtw` files from Explorer
+
+Double-clicking a `.imt` project or `.imtw` workspace file (or picking
+"Open with > Image Measure Tool") opens it straight into the app instead of
+just showing you its raw contents:
+
+- The **built .exe** registers itself as the default handler for both
+  extensions the first time it runs, under your own Windows user account
+  (no admin rights needed) -- no separate setup step. Running from source
+  (`python image_measure_tool.py`) never touches this registration; that
+  only happens for the actual built .exe.
+- If the app is **already open**, double-clicking a file hands it to that
+  same window instead of launching a second copy -- a project switches to
+  its tab (or opens a new one) and a workspace replaces all your tabs
+  (asking first if you have unsaved work), exactly like dropping the file
+  onto it would. If it's **not** already open, that launch becomes the one
+  running instance and opens the file itself.
 
 ## Where things are saved
 
-There are two separate kinds of file, for two separate purposes:
+There are three separate kinds of file, for three separate purposes:
 
+- **Workspace files** (`File > Save All Tabs` / `Save All Tabs As...`,
+  `.imtw`) save **every open tab at once** into a single file -- each tab's
+  image (a full embedded copy, same as a `.imt` project), rotation, lines,
+  and its exact zoom/pan, plus which tab was the active one. `File > Open`
+  reopens all of them in exactly that state in one step (see below --
+  there's a single Open command for both projects and workspaces, so there's
+  nothing extra to pick). Opening a workspace replaces whatever tabs you
+  currently have open -- if any of them have unsaved measurements, you're
+  asked to confirm first, the same way Close All Tabs asks. `Save All Tabs`
+  re-saves to the same workspace file once you've used `Save All Tabs As...`
+  to name one; each tab still keeps its own individual `.imt` project
+  association (if it has one) independently of the workspace.
 - **Project files** (`File > Save Project`, `.imt`) are the deliberate,
   portable save format -- one file per project, containing that tab's image
   path, **a full copy of the image itself**, its rotation, and every line
@@ -82,9 +150,14 @@ There are two separate kinds of file, for two separate purposes:
 - **The session** is a small file the app writes to on its own, every time
   it closes (and every minute while it's open, in case of a crash): which
   tabs were open and every line in them (whether or not you ever hit Save
-  Project), plus program-wide settings like Default Unit. The next time you
-  launch the app, it's read back automatically and the window comes back
-  exactly as you left it. It lives in your
+  Project), plus program-wide settings like Default Unit, Snap Mode, and
+  the main window's own size and screen position. The next time you launch
+  the app, it's read back automatically and the window comes back exactly
+  as you left it -- same size, same spot on screen, Snap Mode on or off the
+  same way you left it. (If the saved position would land off-screen --
+  say, a monitor from last time isn't connected anymore -- only the size is
+  restored, not the position, so the window can never open somewhere
+  unreachable.) It lives in your
   per-user app-data folder (`%APPDATA%\ImageMeasureTool\session.json` on
   Windows; `~/Library/Application Support/ImageMeasureTool/session.json` on
   macOS; `~/.config/ImageMeasureTool/session.json` on Linux) rather than
@@ -97,14 +170,19 @@ There are two separate kinds of file, for two separate purposes:
 
 Closing a tab with the ✕ removes it right away, even from the session --
 only tabs still open when the app quits get carried forward automatically.
-If you want a project to survive on its own regardless, use Save Project.
+If you want a project to survive on its own regardless, use Save Project
+(or Save All Tabs for the whole set at once).
 
 ## How it works
 
 - **File > Open Image** loads a photo, or just drag an image file onto a
-  tab. A photo from a phone or camera
-  that comes in sideways is automatically rotated to match how Windows/Photos
-  displays it (both read the same EXIF orientation tag in the file).
+  tab. It's automatically zoomed to fit the window right away (scaled down
+  to fit if it's larger than the window, left at its real size -- never
+  zoomed in past 100% -- if it's smaller), so you don't have to zoom out
+  manually before you can see the whole thing. A photo from a phone or
+  camera that comes in sideways is automatically rotated to match how
+  Windows/Photos displays it (both read the same EXIF orientation tag in
+  the file).
 - Pick a color at the top: **Red = X**, **Green = Y**, **Blue = Z** -- or just
   press **Tab** (**Shift+Tab** to go back) to cycle to the next color, so you
   don't have to reach for the mouse between measurements. Tab does this even
@@ -293,7 +371,9 @@ If you want a project to survive on its own regardless, use Save Project.
   is close enough, within the same hit-test distance used for clicking a
   line. A point never snaps onto the very line/vertex it's already part of.
   Off by default; toggling it back off goes back to placing points exactly
-  where you click.
+  where you click. Whichever state you leave it in (on or off) is
+  remembered the same way everything else in "Where things are saved" is,
+  so it comes back exactly as you left it next launch.
 - **Undo / Redo** (**Ctrl+Z** / **Ctrl+Y**, or Edit menu): steps back through
   drawing a line, deleting line(s), dragging an endpoint (one step per drag,
   not per pixel it moved), Make Parallel, a known-length or Display-section
@@ -321,7 +401,9 @@ If you want a project to survive on its own regardless, use Save Project.
   calibration for the whole image.
 - Scroll the mouse wheel to zoom in/out towards wherever your cursor is
   pointing (or use the Zoom In/Out/Fit toolbar buttons, which zoom towards
-  the center). Hold the **middle mouse button** and drag to pan. Only the
+  the center) -- or just press **Space** to snap straight back to fitting
+  the whole photo in the window, same as clicking Fit, without reaching for
+  the mouse. Hold the **middle mouse button** and drag to pan. Only the
   portion of the photo actually visible on screen gets resized each frame --
   and zooming out uses a pre-shrunk version of the photo instead of
   downsizing the full-resolution original every frame -- so both zooming in
