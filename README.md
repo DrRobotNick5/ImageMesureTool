@@ -75,6 +75,21 @@ taskbar entry while running).
   open tab with the ones from the file (asking first if that would lose
   unsaved work), the same as `File > Open Workspace`.
 
+## Opening a project or workspace (File > Open)
+
+`File > Open` is the one command for opening EITHER a `.imt` project or a
+`.imtw` workspace -- there's no separate "Open Project" vs "Open Workspace",
+since the file itself already says which one it is. It shows a Recently
+Used list (name, full path, and the file's last-modified time), newest
+first -- click a row and **Open** (or just double-click it) to open that
+exact file, **Remove** to drop an entry you don't want cluttering the list
+anymore (without touching the file itself), or **Browse...** to pick a file
+that isn't in the list yet. Opening something from here goes through the
+same logic as double-clicking the file in Explorer or dragging it onto the
+app (see below), so a project switches to/reopens its tab and a workspace
+replaces all your tabs the same way either time. Every project or workspace
+you open OR save gets added to this list automatically.
+
 ## Opening `.imt`/`.imtw` files from Explorer
 
 Double-clicking a `.imt` project or `.imtw` workspace file (or picking
@@ -100,14 +115,15 @@ There are three separate kinds of file, for three separate purposes:
 - **Workspace files** (`File > Save All Tabs` / `Save All Tabs As...`,
   `.imtw`) save **every open tab at once** into a single file -- each tab's
   image (a full embedded copy, same as a `.imt` project), rotation, lines,
-  and its exact zoom/pan, plus which tab was the active one. `File > Open
-  Workspace (All Tabs)...` reopens all of them in exactly that state in one
-  step. Opening a workspace replaces whatever tabs you currently have open
-  -- if any of them have unsaved measurements, you're asked to confirm
-  first, the same way Close All Tabs asks. `Save All Tabs` re-saves to the
-  same workspace file once you've used `Save All Tabs As...` to name one;
-  each tab still keeps its own individual `.imt` project association (if
-  it has one) independently of the workspace.
+  and its exact zoom/pan, plus which tab was the active one. `File > Open`
+  reopens all of them in exactly that state in one step (see below --
+  there's a single Open command for both projects and workspaces, so there's
+  nothing extra to pick). Opening a workspace replaces whatever tabs you
+  currently have open -- if any of them have unsaved measurements, you're
+  asked to confirm first, the same way Close All Tabs asks. `Save All Tabs`
+  re-saves to the same workspace file once you've used `Save All Tabs As...`
+  to name one; each tab still keeps its own individual `.imt` project
+  association (if it has one) independently of the workspace.
 - **Project files** (`File > Save Project`, `.imt`) are the deliberate,
   portable save format -- one file per project, containing that tab's image
   path, **a full copy of the image itself**, its rotation, and every line

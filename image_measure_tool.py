@@ -57,6 +57,7 @@ import os
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from multiprocessing.connection import Client, Listener
 
@@ -167,6 +168,12 @@ def _session_dir():
 
 SESSION_PATH = os.path.join(_session_dir(), "session.json")
 SESSION_AUTOSAVE_MS = 60_000  # also save periodically, in case of a crash
+# File > Open's "recently used" list (see App.open_recent_dialog) -- every
+# .imt project or .imtw workspace opened OR saved gets recorded here,
+# newest first, so it's persisted across launches the same way session.json
+# and recent_files.json's neighbors are.
+RECENT_FILES_PATH = os.path.join(_session_dir(), "recent_files.json")
+MAX_RECENT_FILES = 25
 
 # --------------------------------------------------------- single instance
 # Double-clicking a .imt/.imtw file (or "Open with") launches a NEW copy of
@@ -2928,6 +2935,7 @@ class ProjectTab(ttk.Frame):
             json.dump(data, f, indent=2)
         self.dirty = False
         self.app.update_tab_title(self)
+        self.app._record_recent_file(path)
         size_note = ""
         if image_data_b64:
             size_kb = (len(image_data_b64) * 3 // 4) // 1024
@@ -2992,6 +3000,7 @@ class ProjectTab(ttk.Frame):
             color: saved_modes.get(color) for color in AXIS_COLORS}
         self.dirty = False
         self.app.update_tab_title(self)
+        self.app._record_recent_file(path)
         self.fit_to_window()
         self.redraw()
         self.app.set_status(f"Loaded project {path}{status_note}")
@@ -3148,13 +3157,15 @@ class App:
         filemenu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+T")
         filemenu.add_command(label="Open Image...", command=self.open_image, accelerator="Ctrl+O")
         filemenu.add_separator()
-        filemenu.add_command(label="Open Project...", command=self.open_project)
+        # One unified "Open..." for both a .imt project and a .imtw
+        # workspace -- open_path() (which this dialog funnels through)
+        # already tells them apart by extension, so there's no reason to
+        # make you pick which kind of file you're opening up front.
+        filemenu.add_command(label="Open...", command=self.open_recent_dialog)
         filemenu.add_command(label="Save Project", command=lambda: self._dispatch("save_project"),
                               accelerator="Ctrl+S")
         filemenu.add_command(label="Save Project As...",
                               command=lambda: self._dispatch("save_project_as"))
-        filemenu.add_separator()
-        filemenu.add_command(label="Open Workspace (All Tabs)...", command=self.open_workspace)
         filemenu.add_command(label="Save All Tabs", command=self.save_workspace)
         filemenu.add_command(label="Save All Tabs As...", command=self.save_workspace_as)
         filemenu.add_separator()
@@ -3753,14 +3764,126 @@ class App:
             return
         self._open_into_tab(lambda tab: tab.load_image_path(path))
 
-    def open_project(self):
-        path = filedialog.askopenfilename(
-            title="Open project",
-            filetypes=[("Image Measure project", f"*{PROJECT_EXT} *{LEGACY_PROJECT_EXT}"),
-                       ("All files", "*.*")])
+    # -------------------------------------------------------------- open...
+    # One unified "Open..." for both a .imt project AND a .imtw workspace
+    # (Nick: "there should not be a difference between open project or open
+    # workspace, i just want one open command") -- a TIA-Portal-style
+    # Recently Used list, since open_path() already tells the two apart by
+    # extension, so nothing here has to ask which kind you're picking.
+    def _load_recent_files(self):
+        try:
+            with open(RECENT_FILES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [p for p in data.get("paths", []) if isinstance(p, str)]
+        except Exception:
+            return []
+
+    def _save_recent_files(self, paths):
+        try:
+            os.makedirs(os.path.dirname(RECENT_FILES_PATH), exist_ok=True)
+            tmp = RECENT_FILES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"paths": paths}, f, indent=2)
+            os.replace(tmp, RECENT_FILES_PATH)
+        except Exception:
+            pass  # best-effort -- a broken recent-files list should never break opening/saving
+
+    def _record_recent_file(self, path):
+        """Add/move `path` to the front of the Open... dialog's recently-
+        used list -- deduped, capped, newest first. Called whenever a
+        project or workspace is successfully opened OR saved."""
         if not path:
             return
-        self._open_into_tab(lambda tab: tab.load_project_data(path))
+        paths = [p for p in self._load_recent_files() if p != path]
+        paths.insert(0, path)
+        self._save_recent_files(paths[:MAX_RECENT_FILES])
+
+    def open_recent_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Open")
+        dialog.transient(self.root)
+        dialog.geometry("720x420")
+        dialog.minsize(480, 280)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Recently used", font=("", 10, "bold")).pack(
+            anchor="w", pady=(0, 6))
+
+        tree_frame = ttk.Frame(outer)
+        tree_frame.pack(fill="both", expand=True)
+        columns = ("name", "path", "changed")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                             selectmode="browse")
+        tree.heading("name", text="Name")
+        tree.heading("path", text="Path")
+        tree.heading("changed", text="Last change")
+        tree.column("name", width=200, anchor="w")
+        tree.column("path", width=340, anchor="w")
+        tree.column("changed", width=140, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def populate():
+            tree.delete(*tree.get_children())
+            for path in self._load_recent_files():
+                name = os.path.splitext(os.path.basename(path))[0]
+                try:
+                    changed = time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(os.path.getmtime(path)))
+                except OSError:
+                    changed = "(file not found)"
+                tree.insert("", "end", iid=path, values=(name, path, changed))
+
+        def do_open(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            path = sel[0]
+            if not os.path.exists(path):
+                messagebox.showerror(
+                    "File not found",
+                    f"Couldn't find:\n{path}\n\nIt may have been moved or deleted.")
+                return
+            dialog.destroy()
+            self.open_path(path)
+
+        def remove_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            remaining = [p for p in self._load_recent_files() if p not in sel]
+            self._save_recent_files(remaining)
+            populate()
+
+        def browse():
+            path = filedialog.askopenfilename(
+                title="Open",
+                filetypes=[("Image Measure project or workspace",
+                            f"*{PROJECT_EXT} *{WORKSPACE_EXT} *{LEGACY_PROJECT_EXT}"),
+                           ("All files", "*.*")])
+            if not path:
+                return
+            dialog.destroy()
+            self.open_path(path)
+
+        populate()
+        tree.bind("<Double-1>", do_open)
+
+        btn_frame = ttk.Frame(outer)
+        btn_frame.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_frame, text="Browse...", command=browse).pack(side="left")
+        ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(btn_frame, text="Open", command=do_open).pack(side="right", padx=(0, 6))
+
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
 
     def handle_dropped_file(self, source_tab, path):
         self._open_into_tab(lambda tab: tab.load_image_path(path), prefer_tab=source_tab)
@@ -3837,6 +3960,7 @@ class App:
         for t in savable:
             t.dirty = False
             self.update_tab_title(t)
+        self._record_recent_file(path)
         size_kb = os.path.getsize(path) // 1024
         self.set_status(f"Saved {len(tabs_data)} tab(s) to workspace "
                          f"{os.path.basename(path)} ({size_kb:,} KB).")
@@ -3880,6 +4004,7 @@ class App:
             self.notebook.add(tab, text=title)
 
         self.workspace_path = path
+        self._record_recent_file(path)
         idx = data.get("active_index", 0)
         tabs = self.notebook.tabs()
         if 0 <= idx < len(tabs):
@@ -4178,6 +4303,7 @@ class App:
             for tab in self._all_tabs():
                 if tab.project_path == path:
                     self.notebook.select(tab)
+                    self._record_recent_file(path)
                     return
             self._open_into_tab(lambda tab: tab.load_project_data(path))
             return
