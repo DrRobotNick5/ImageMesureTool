@@ -3260,26 +3260,72 @@ class App:
         self.toolbar_bar = bar
         bar_window = canvas.create_window((0, 0), window=bar, anchor="nw")
 
-        def _sync_toolbar_layout(event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"),
+        # _sync_toolbar_layout decides whether the scrollbar needs to be
+        # shown, by comparing how wide `bar`'s content actually needs to
+        # be (winfo_reqwidth()) against how wide the canvas viewport
+        # currently is.
+        #
+        # THE REAL BUG (found after `bar.bind("<Configure>", ...)` alone
+        # turned out not to be enough, even with fresh/settled reads):
+        # `bar`'s on-screen width is PINNED by `canvas.itemconfigure(...,
+        # width=...)` below, once that's ever been set -- so `bar` no
+        # longer auto-resizes to fit its own content the way a normally
+        # packed/gridded frame would. That means `bar`'s <Configure> only
+        # ever fires for the very first layout (before anything has
+        # pinned its width yet) or when WE explicitly change that pinned
+        # width ourselves -- never just because a child's own content
+        # changed size (e.g. the Make Parallel hint label growing or
+        # shrinking its text) without the window itself being resized.
+        # `canvas`'s own <Configure> only fires on an actual window
+        # resize for the same reason. So a pure content-size change,
+        # exactly the "options are off screen" scenario, was never
+        # reaching this sync logic AT ALL -- not a timing/staleness
+        # problem, a "nothing ever asked" problem. Fixed by also calling
+        # self._schedule_toolbar_sync() explicitly from
+        # refresh_toolbar_hint(), the only place button/label text
+        # changes after the initial build, any time it changes what's
+        # shown.
+        #
+        # Kept as a debounced after_idle callback (rather than computing
+        # synchronously inside whatever triggered it) regardless, since a
+        # widget's requested size is really only guaranteed accurate once
+        # Tk's own idle-time geometry recomputation has finished, and
+        # this coalesces bursts of triggers (e.g. a resize drag) into one
+        # actual layout pass.
+        self._toolbar_sync_job = None
+
+        def _sync_toolbar_layout():
+            self._toolbar_sync_job = None
+            req_w = bar.winfo_reqwidth()
+            canvas.configure(scrollregion=(0, 0, req_w, bar.winfo_reqheight()),
                               height=bar.winfo_reqheight())
-            if bar.winfo_reqwidth() > canvas.winfo_width():
+            # Let the embedded row match the canvas's width when there's
+            # room to spare, but never shrink it below what its content
+            # actually needs -- that's what makes it scroll instead of
+            # squashing the buttons once the window gets narrow. Doing
+            # this here (instead of separately, from canvas's own
+            # <Configure>) means it always uses the same freshly-settled
+            # req_w as the show/hide decision right below it.
+            canvas.itemconfigure(bar_window, width=max(canvas.winfo_width(), req_w))
+            if req_w > canvas.winfo_width():
                 if not hscroll.winfo_ismapped():
                     hscroll.pack(side="top", fill="x")
             elif hscroll.winfo_ismapped():
                 hscroll.pack_forget()
                 canvas.xview_moveto(0)
 
-        def _sync_canvas_item_width(event):
-            # Let the embedded row match the canvas's width when there's
-            # room to spare, but never shrink it below what its content
-            # actually needs -- that's what makes it scroll instead of
-            # squashing the buttons once the window gets narrow.
-            canvas.itemconfigure(bar_window, width=max(event.width, bar.winfo_reqwidth()))
-            _sync_toolbar_layout()
+        def _schedule_toolbar_sync(event=None):
+            if self._toolbar_sync_job is not None:
+                self.root.after_cancel(self._toolbar_sync_job)
+            self._toolbar_sync_job = self.root.after_idle(_sync_toolbar_layout)
 
-        bar.bind("<Configure>", _sync_toolbar_layout)
-        canvas.bind("<Configure>", _sync_canvas_item_width)
+        # Exposed on self so refresh_toolbar_hint (the only other place
+        # that changes toolbar content after this initial build) can
+        # trigger a re-check explicitly -- see the comment above.
+        self._schedule_toolbar_sync = _schedule_toolbar_sync
+
+        bar.bind("<Configure>", _schedule_toolbar_sync)
+        canvas.bind("<Configure>", _schedule_toolbar_sync)
 
         def _on_toolbar_wheel(event):
             canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
@@ -3698,6 +3744,14 @@ class App:
                 ref_label = f"#{ln.id} ({ln.color})" if ln else "?"
                 self.parallel_hint.config(
                     text=f"Make Parallel: click the line to make parallel to {ref_label}")
+            # The button/hint text just changed, which can change how wide
+            # the toolbar's content needs to be -- but `bar` (the toolbar's
+            # embedded row) doesn't auto-fire its own <Configure> just from
+            # a child's content changing (see the comment in
+            # _build_toolbar on why), so the scrollbar show/hide check
+            # would otherwise never be told about it. Ask for it
+            # explicitly every time this method changes the text.
+            self._schedule_toolbar_sync()
             return
         self.parallel_button.config(text="Make Parallel (P)")
         ref = tab._parallel_reference()
@@ -3706,6 +3760,7 @@ class App:
                 text=f"Hold Shift to draw parallel to line #{ref.id} ({ref.color})")
         else:
             self.parallel_hint.config(text="")
+        self._schedule_toolbar_sync()
 
     def _build_tabs_menu(self):
         """Every open tab, by name -- including ones whose on-screen tab
