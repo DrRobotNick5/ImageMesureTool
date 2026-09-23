@@ -77,18 +77,27 @@ taskbar entry while running).
 
 ## Opening a project or workspace (File > Open)
 
-`File > Open` is the one command for opening EITHER a `.imt` project or a
-`.imtw` workspace -- there's no separate "Open Project" vs "Open Workspace",
-since the file itself already says which one it is. It shows a Recently
-Used list (name, full path, and the file's last-modified time), newest
-first -- click a row and **Open** (or just double-click it) to open that
-exact file, **Remove** to drop an entry you don't want cluttering the list
-anymore (without touching the file itself), or **Browse...** to pick a file
-that isn't in the list yet. Opening something from here goes through the
-same logic as double-clicking the file in Explorer or dragging it onto the
-app (see below), so a project switches to/reopens its tab and a workspace
-replaces all your tabs the same way either time. Every project or workspace
-you open OR save gets added to this list automatically.
+`File > Open` (**Ctrl+Shift+O**) is the one command for opening EITHER a
+`.imt` project or a `.imtw` workspace -- there's no separate "Open Project"
+vs "Open Workspace", since the file itself already says which one it is. It
+shows a Recently Used list (name, full path, and the file's last-modified
+time), newest first -- click a row and **Open** (or just double-click it)
+to open that exact file, **Remove** to drop an entry you don't want
+cluttering the list anymore (without touching the file itself), or
+**Browse...** to pick a file that isn't in the list yet. Opening something
+from here goes through the same logic as double-clicking the file in
+Explorer or dragging it onto the app (see below), so a project switches
+to/reopens its tab and a workspace replaces all your tabs the same way
+either time. Every project or workspace you open OR save gets added to this
+list automatically.
+
+The dialog also remembers its own size and position, separately from the
+main window -- resize or move it, and it reopens at that same size and
+spot next time, whether you closed it by opening a file, Cancel, or the
+window's own close button.
+
+**Save All Tabs** (the workspace save, `File > Save All Tabs`) has its own
+shortcut too: **Ctrl+Shift+S**.
 
 ## Opening `.imt`/`.imtw` files from Explorer
 

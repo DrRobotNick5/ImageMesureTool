@@ -3109,6 +3109,11 @@ class App:
         # without asking for a filename every time, same as a per-tab
         # project's Save vs Save As.
         self.workspace_path = None
+        # The Open... dialog's own last size+position (separate from the
+        # main window's -- see save_session/_restore_session), so it opens
+        # back up where you left it instead of the same default spot every
+        # time.
+        self.open_dialog_geometry = None
 
         self._build_menu()
         self._build_toolbar()
@@ -3142,6 +3147,12 @@ class App:
         self.root.bind("<Control-z>", lambda e: self._dispatch("undo"))
         self.root.bind("<Control-y>", lambda e: self._dispatch("redo"))
         self.root.bind("<Control-Shift-Z>", lambda e: self._dispatch("redo"))
+        # Ctrl+Shift+O = the unified Open... dialog, Ctrl+Shift+S = Save
+        # All Tabs (workspace) -- picked to sit next to the existing
+        # Ctrl+O (Open Image) / Ctrl+S (Save Project) so the "bigger"
+        # multi-tab operations share the same letter with Shift added.
+        self.root.bind("<Control-Shift-O>", lambda e: self.open_recent_dialog())
+        self.root.bind("<Control-Shift-S>", lambda e: self.save_workspace())
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
 
@@ -3161,12 +3172,14 @@ class App:
         # workspace -- open_path() (which this dialog funnels through)
         # already tells them apart by extension, so there's no reason to
         # make you pick which kind of file you're opening up front.
-        filemenu.add_command(label="Open...", command=self.open_recent_dialog)
+        filemenu.add_command(label="Open...", command=self.open_recent_dialog,
+                              accelerator="Ctrl+Shift+O")
         filemenu.add_command(label="Save Project", command=lambda: self._dispatch("save_project"),
                               accelerator="Ctrl+S")
         filemenu.add_command(label="Save Project As...",
                               command=lambda: self._dispatch("save_project_as"))
-        filemenu.add_command(label="Save All Tabs", command=self.save_workspace)
+        filemenu.add_command(label="Save All Tabs", command=self.save_workspace,
+                              accelerator="Ctrl+Shift+S")
         filemenu.add_command(label="Save All Tabs As...", command=self.save_workspace_as)
         filemenu.add_separator()
         filemenu.add_command(label="Close Tab", command=self.close_active_tab, accelerator="Ctrl+W")
@@ -3802,8 +3815,21 @@ class App:
         dialog = tk.Toplevel(self.root)
         dialog.title("Open")
         dialog.transient(self.root)
-        dialog.geometry("720x420")
+        if self.open_dialog_geometry:
+            self._apply_saved_geometry(self.open_dialog_geometry, widget=dialog)
+        else:
+            dialog.geometry("720x420")
         dialog.minsize(480, 280)
+
+        def close_dialog():
+            # Remembered (session.json, same as the main window's own size
+            # and position) so the dialog reopens where you left it instead
+            # of the same default spot every time.
+            try:
+                self.open_dialog_geometry = dialog.geometry()
+            except tk.TclError:
+                pass
+            dialog.destroy()
 
         outer = ttk.Frame(dialog, padding=10)
         outer.pack(fill="both", expand=True)
@@ -3847,7 +3873,7 @@ class App:
                     "File not found",
                     f"Couldn't find:\n{path}\n\nIt may have been moved or deleted.")
                 return
-            dialog.destroy()
+            close_dialog()
             self.open_path(path)
 
         def remove_selected():
@@ -3866,7 +3892,7 @@ class App:
                            ("All files", "*.*")])
             if not path:
                 return
-            dialog.destroy()
+            close_dialog()
             self.open_path(path)
 
         populate()
@@ -3877,9 +3903,10 @@ class App:
         ttk.Button(btn_frame, text="Browse...", command=browse).pack(side="left")
         ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(
             side="left", padx=(6, 0))
-        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(btn_frame, text="Cancel", command=close_dialog).pack(side="right")
         ttk.Button(btn_frame, text="Open", command=do_open).pack(side="right", padx=(0, 6))
 
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
         try:
             dialog.grab_set()
         except tk.TclError:
@@ -4036,7 +4063,8 @@ class App:
                     "default_display_mode": self.default_display_mode.get(),
                     "window_geometry": self.root.geometry(),
                     "window_state": window_state,
-                    "snap_mode": self.snap_mode.get()}
+                    "snap_mode": self.snap_mode.get(),
+                    "open_dialog_geometry": self.open_dialog_geometry}
             os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
             tmp = SESSION_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -4071,15 +4099,17 @@ class App:
                 pass
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
-    def _apply_saved_geometry(self, geom):
-        """Restore the window to its saved size+position (see save_session)
-        -- but only the position if it would still land at least partly on
-        a currently-connected screen (across ALL monitors, see
-        _virtual_screen_bounds). Without this check, a saved position from
-        a monitor that's since been unplugged (or a resolution that's
+    def _apply_saved_geometry(self, geom, widget=None):
+        """Restore `widget` (the main window by default, but also used for
+        the Open... dialog -- see open_recent_dialog) to a saved
+        size+position -- but only the position if it would still land at
+        least partly on a currently-connected screen (across ALL monitors,
+        see _virtual_screen_bounds). Without this check, a saved position
+        from a monitor that's since been unplugged (or a resolution that's
         changed) would leave the window opening off-screen where it can't
         be reached -- so in that case just the SIZE is restored, and the
         window manager picks a normal default position instead."""
+        widget = widget if widget is not None else self.root
         m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geom)
         if not m:
             return
@@ -4093,9 +4123,9 @@ class App:
                      top - margin <= y <= bottom - margin)
         try:
             if on_screen:
-                self.root.geometry(geom)
+                widget.geometry(geom)
             else:
-                self.root.geometry(f"{w}x{h}")
+                widget.geometry(f"{w}x{h}")
         except tk.TclError:
             pass
 
@@ -4197,6 +4227,8 @@ class App:
             self.default_display_mode.set(data["default_display_mode"])
         if isinstance(data.get("snap_mode"), bool):
             self.snap_mode.set(data["snap_mode"])
+        if data.get("open_dialog_geometry"):
+            self.open_dialog_geometry = data["open_dialog_geometry"]
         if data.get("window_geometry"):
             self._apply_saved_geometry(data["window_geometry"])
         if data.get("window_state") == "zoomed":
